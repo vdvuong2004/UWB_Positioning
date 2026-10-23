@@ -178,6 +178,10 @@ void reset();
 void softReset();
 void idle();
 void spiBegin(uint8_t irq, uint8_t rst);
+#if defined(ARDUINO_ARCH_STM32) && defined(STM32F103xE)
+/* True when SystemClock_Config() started the custom board's 8 MHz crystal. */
+extern bool dw3000_clock_from_hse;
+#endif
 void spiSelect(uint8_t ss);
 void spiSetFastRate(void);
 void enableClock(byte clock);

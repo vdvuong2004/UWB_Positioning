@@ -7,13 +7,13 @@
  * ex_dwm3000_dwm1000_init and prints DIST 3000.
  * Answers only poll 0xE2. IEEE SFD, same radio as the other modules.
  * Board: Generic STM32F1 series, part "Generic F103RCTx" (STM32F103xE).
- * Console USART1 PA9/PA10, 115200. Same wiring as the initiator:
- *   SCK  PA5
- *   MISO PA6
- *   MOSI PA7
- *   CS   PA4
- *   IRQ  PB1
- *   RST  PB0
+ * Console USART1 PA9/PA10, 115200. Custom board wiring (dw3000_board_config.h):
+ *   SCK  PB3
+ *   MISO PB4
+ *   MOSI PB5
+ *   CS   PA15
+ *   IRQ  PC12
+ *   RST  PD2
  */
 
 const uint8_t PIN_RST = DW3000_PIN_RST;
@@ -58,8 +58,9 @@ static uint64_t resp_tx_ts;
 
 static dwt_txconfig_t txconfig_peer = { 0x34, 0x48484848, 0x0 };
 
-/* PC13 on most F103RC boards. Change it if the board LED is elsewhere. */
-#if defined(ARDUINO_ARCH_STM32)
+/* The custom F103RC board has no MCU-driven LED (D4 is on EXTON), so it
+ * only blinks on other STM32 boards. */
+#if defined(ARDUINO_ARCH_STM32) && !defined(STM32F103xE)
 #define LED_PIN PC13
 #endif
 
@@ -87,6 +88,9 @@ void setup()
 #endif
   UART_init();
   test_run_info((unsigned char *)APP_NAME);
+#if defined(STM32F103xE)
+  test_run_info((unsigned char *)(dw3000_clock_from_hse ? "CLOCK HSE 72 MHz" : "CLOCK HSI 64 MHz (crystal failed)"));
+#endif
 
   spiBegin(PIN_IRQ, PIN_RST);
   spiSelect(PIN_SS);

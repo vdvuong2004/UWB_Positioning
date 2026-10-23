@@ -33,6 +33,44 @@
 #define DW3000_PIN_MISO 10
 #endif
 
+#elif defined(ARDUINO_ARCH_STM32) && defined(STM32F103xE)
+
+// ============================================================
+// Custom STM32F103RCT6 board ("Generic F103RCTx") + DWM3000 on J7/J8
+//   DWM3000 SCK  -> PB3
+//   DWM3000 MISO -> PB4
+//   DWM3000 MOSI -> PB5
+//   DWM3000 CS   -> PA15
+//   DWM3000 IRQ  -> PC12 (R12 10k pull-down)
+//   DWM3000 RST  -> PD2
+// PA15/PB3/PB4 are JTAG pins at reset. pinMode() on them makes the core
+// remap SWJ to NOJTAG, so SWD on PA13/PA14 keeps working.
+// ============================================================
+
+#ifndef DW3000_PIN_RST
+#define DW3000_PIN_RST PD2
+#endif
+
+#ifndef DW3000_PIN_IRQ
+#define DW3000_PIN_IRQ PC12
+#endif
+
+#ifndef DW3000_PIN_CS
+#define DW3000_PIN_CS PA15
+#endif
+
+#ifndef DW3000_PIN_SCK
+#define DW3000_PIN_SCK PB3
+#endif
+
+#ifndef DW3000_PIN_MISO
+#define DW3000_PIN_MISO PB4
+#endif
+
+#ifndef DW3000_PIN_MOSI
+#define DW3000_PIN_MOSI PB5
+#endif
+
 #elif defined(ARDUINO_ARCH_STM32)
 
 // ============================================================
