@@ -71,6 +71,13 @@
 #define DW3000_PIN_MOSI PB5
 #endif
 
+/* Bit-bang half-clock wait (dw3000_port.cpp). 0 to 40 all read and wrote
+ * without error on two of these boards; 2 (~22 us per byte, 10x the default)
+ * keeps one step of margin and lets a responder reply in a few ms. */
+#ifndef DW3000_STM32_BB_LOOPS
+#define DW3000_STM32_BB_LOOPS 2
+#endif
+
 #elif defined(ARDUINO_ARCH_STM32)
 
 // ============================================================

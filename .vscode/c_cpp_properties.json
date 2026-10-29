@@ -1,0 +1,75 @@
+{
+  "env": {
+    "stm32Core": "${env:LOCALAPPDATA}/Arduino15/packages/STMicroelectronics/hardware/stm32/3.0.0",
+    "stm32Tools": "${env:LOCALAPPDATA}/Arduino15/packages/STMicroelectronics/tools",
+    "esp32Core": "${env:LOCALAPPDATA}/Arduino15/packages/esp32/hardware/esp32/3.3.12",
+    "esp32Tools": "${env:LOCALAPPDATA}/Arduino15/packages/esp32/tools",
+    "uwbLibs": [
+      "${workspaceFolder}/Libraries/Dw3000/src",
+      "${workspaceFolder}/Libraries/arduino-dw1000-master/src"
+    ]
+  },
+  "configurations": [
+    {
+      "name": "STM32F103RC (Arduino STM32)",
+      "compilerPath": "${stm32Tools}/xpack-arm-none-eabi-gcc/14.2.1-1.1/bin/arm-none-eabi-g++.exe",
+      "compilerArgs": ["-mcpu=cortex-m3", "-mthumb"],
+      "intelliSenseMode": "gcc-arm",
+      "cStandard": "gnu17",
+      "cppStandard": "gnu++17",
+      "includePath": [
+        "${uwbLibs}",
+        "${stm32Core}/cores/arduino",
+        "${stm32Core}/cores/arduino/avr",
+        "${stm32Core}/cores/arduino/stm32",
+        "${stm32Core}/cores/arduino/api/deprecated",
+        "${stm32Core}/variants/STM32F1xx/F103R(C-D-E)T",
+        "${stm32Core}/libraries/SPI/src",
+        "${stm32Core}/libraries/Wire/src",
+        "${stm32Core}/libraries/SrcWrapper/inc",
+        "${stm32Core}/libraries/SrcWrapper/inc/LL",
+        "${stm32Core}/system/STM32F1xx",
+        "${stm32Core}/system/Drivers/STM32F1xx_HAL_Driver/Inc",
+        "${stm32Core}/system/Drivers/CMSIS/Device/ST/STM32F1xx/Include",
+        "${stm32Tools}/CMSIS/6.3.0/CMSIS/Core/Include"
+      ],
+      "defines": [
+        "STM32F1xx",
+        "STM32F103xE",
+        "ARDUINO=10607",
+        "ARDUINO_GENERIC_F103RCTX",
+        "ARDUINO_ARCH_STM32",
+        "BOARD_NAME=\"GENERIC_F103RCTX\"",
+        "VARIANT_H=\"variant_generic.h\"",
+        "HAL_UART_MODULE_ENABLED"
+      ],
+      "forcedInclude": ["${stm32Core}/cores/arduino/Arduino.h"]
+    },
+    {
+      "name": "ESP32-C3 (Arduino ESP32)",
+      "compilerPath": "${esp32Tools}/esp-rv32/2601/bin/riscv32-esp-elf-g++.exe",
+      "intelliSenseMode": "gcc-x86",
+      "cStandard": "gnu17",
+      "cppStandard": "gnu++2b",
+      "includePath": [
+        "${uwbLibs}",
+        "${esp32Core}/cores/esp32",
+        "${esp32Core}/variants/esp32c3",
+        "${esp32Core}/libraries/**",
+        "${esp32Tools}/esp32c3-libs/3.3.12/include/**",
+        "${esp32Tools}/esp32c3-libs/3.3.12/qio_qspi/include"
+      ],
+      "defines": [
+        "ARDUINO=10607",
+        "ARDUINO_ESP32C3_DEV",
+        "ARDUINO_ARCH_ESP32",
+        "ESP32",
+        "CONFIG_IDF_TARGET_ESP32C3=1",
+        "ARDUINO_USB_CDC_ON_BOOT=1",
+        "ARDUINO_USB_MODE=1"
+      ],
+      "forcedInclude": ["${esp32Core}/cores/esp32/Arduino.h"]
+    }
+  ],
+  "version": 4
+}

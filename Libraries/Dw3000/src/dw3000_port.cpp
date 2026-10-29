@@ -420,7 +420,7 @@ void Sleep(uint32_t d) {
 #if defined(ARDUINO_ARCH_STM32) && defined(STM32F103xE)
 /* The core's Generic F103RCTx clock runs from the internal HSI. Use the
  * custom board's 8 MHz crystal (Y1 on PD0/PD1) for 72 MHz and an exact UART
- * baud. Falls back to HSI 64 MHz if the crystal does not start. */
+ * baud. Falls back to HSI 64 MHz (48 MHz with USB) if the crystal does not start. */
 bool dw3000_clock_from_hse = false;
 
 extern "C" void SystemClock_Config(void)
@@ -443,7 +443,12 @@ extern "C" void SystemClock_Config(void)
     RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
     RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
     RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
+#if defined(USBCON)
+    /* 48 MHz: the only HSI clock USB can run from (PLL / 1). */
+    RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL12;
+#else
     RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL16;
+#endif
     if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
       Error_Handler();
     }
@@ -458,6 +463,16 @@ extern "C" void SystemClock_Config(void)
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
     Error_Handler();
   }
+
+#if defined(USBCON)
+  /* USB needs exactly 48 MHz: 72 / 1.5 from the crystal, 48 / 1 from HSI. */
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {};
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB;
+  PeriphClkInit.UsbClockSelection = dw3000_clock_from_hse ? RCC_USBCLKSOURCE_PLL_DIV1_5 : RCC_USBCLKSOURCE_PLL;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK) {
+    Error_Handler();
+  }
+#endif
 }
 #endif
 
@@ -469,11 +484,17 @@ static uint32_t _bb_sck_bit;
 static uint32_t _bb_mosi_bit;
 static uint32_t _bb_miso_bit;
 
+/* Half-clock wait. 40 gives ~10 us at 72 MHz (~165 us per byte). Override with
+ * -DDW3000_STM32_BB_LOOPS=n to trade SPI speed against margin. */
+#ifndef DW3000_STM32_BB_LOOPS
+#define DW3000_STM32_BB_LOOPS 40
+#endif
+
 static void stm32_bb_wait(void)
 {
-  /* ~10 us at 72 MHz. delayMicroseconds(1) returns immediately on this core,
-   * so MOSI was still changing on the same edge as SCK. */
-  for (volatile uint16_t n = 0; n < 40; n++) {
+  /* delayMicroseconds(1) returns immediately on this core, so MOSI was still
+   * changing on the same edge as SCK. */
+  for (volatile uint16_t n = 0; n < DW3000_STM32_BB_LOOPS; n++) {
     __NOP();
   }
 }

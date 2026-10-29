@@ -11,6 +11,10 @@
 /* Core 3.0 leaves Serial1 unlinked unless that UART is enabled in the
  * board menu. Uart is the concrete port; TX stays PA9, RX stays PA10. */
 static Uart DwUart(USART1);
+#if defined(USBCON) && defined(USBD_USE_CDC)
+/* Tools > USB support > CDC: mirror the console to the board's own USB port. */
+#define DW_USB_CONSOLE 1
+#endif
 #endif
 
 void UART_init(void)
@@ -19,6 +23,9 @@ void UART_init(void)
     DwUart.setTx(PA9);
     DwUart.setRx(PA10);
     DwUart.begin(115200);
+#if defined(DW_USB_CONSOLE)
+    SerialUSB.begin(115200);
+#endif
 #else
     Serial.begin(115200);
 #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
@@ -34,6 +41,9 @@ static void console_putc(char data)
 {
 #if defined(ARDUINO_ARCH_STM32)
     DwUart.write((uint8_t)data);
+#if defined(DW_USB_CONSOLE)
+    SerialUSB.write((uint8_t)data);
+#endif
 #elif defined(ARDUINO_ARCH_ESP32) && !(defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT)
     printf("%c", data);
 #else
@@ -45,6 +55,9 @@ static void console_puts(const char *s)
 {
 #if defined(ARDUINO_ARCH_STM32)
     DwUart.print(s);
+#if defined(DW_USB_CONSOLE)
+    SerialUSB.print(s);
+#endif
 #elif defined(ARDUINO_ARCH_ESP32) && !(defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT)
     printf("%s", s);
 #else

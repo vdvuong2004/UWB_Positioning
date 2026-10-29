@@ -42,8 +42,8 @@ All platform-specific code lives in `dw3000_port.cpp`, `dw3000_uart.cpp`, `dw300
 - **The pins are compiled into the library.** `spiBegin` uses `DW3000_PIN_*` from `dw3000_board_config.h` directly. A `#define` in a sketch does not reach the library's `.cpp` files, so changing the wiring means editing `dw3000_board_config.h` or passing `-D` build flags. Sketches copy the macros into `PIN_RST`/`PIN_IRQ`/`PIN_SS`.
 - **CS is a plain GPIO**, never the SPI peripheral's hardware SS. On ESP32, `SPI.begin(sck, miso, mosi, -1)` is called for this reason.
 - **SPI speed:** `spiBegin` starts at 2 MHz (`_slowSPI`). Sketches call `spiSetFastRate()` (7 MHz, the DW3000 limit before PLL lock) only after `dwt_initialise` and `dwt_configure`. Don't raise `_fastSPI` above 7 MHz.
-- **STM32 uses bit-banged SPI** (`stm32_bitbang_pins` and `stm32_bb_transfer`, about 10 µs per half clock). STM32 hardware SPI1 could read the device ID, but every other command byte arrived as 0x00. The SPI1 peripheral is disabled and SCK/MOSI are driven through BSRR. As a result, `spiSetFastRate()` does nothing on STM32, and STM32 responders need long reply delays.
-- **The STM32 console is USART1 on PA9/PA10** (`Uart DwUart(USART1)`), not `Serial`, which is the USB/ST-LINK port on that core. On ESP32 without USB-CDC, output goes through `printf`.
+- **STM32 uses bit-banged SPI** (`stm32_bitbang_pins` and `stm32_bb_transfer`, about 10 µs per half clock). STM32 hardware SPI1 could read the device ID, but every other command byte arrived as 0x00. The SPI1 peripheral is disabled and SCK/MOSI are driven through BSRR. As a result, `spiSetFastRate()` does nothing on STM32, and STM32 responders need long reply delays. The half-clock wait is `DW3000_STM32_BB_LOOPS` (default 40, ~228 µs per byte including CS overhead). The custom F103RC board sets it to 2 in `dw3000_board_config.h` (~22 µs per byte). That value was tested error-free on two boards, before and after RX.
+- **The STM32 console is USART1 on PA9/PA10** (`Uart DwUart(USART1)`), not `Serial`, which is the USB/ST-LINK port on that core. With Tools > USB support: CDC (`USBCON` + `USBD_USE_CDC`), `test_run_info` also mirrors to `SerialUSB`, and the F103xE `SystemClock_Config` sets the 48 MHz USB clock (HSI fallback drops to 48 MHz). On ESP32 without USB-CDC, output goes through `printf`.
 - **RST is open-drain.** `reset()` drives the pin low for 2 ms, then releases it to `INPUT_PULLUP`. Never drive it high.
 - **ESP32-WROOM:** GPIO 6–11 are the flash pins. Don't assign them.
 - The IRQ functions (`port_GetEXT_IRQStatus` and others) only flip a flag. The examples poll `SYS_STATUS` and don't use interrupts.
@@ -52,6 +52,7 @@ All platform-specific code lives in `dw3000_port.cpp`, `dw3000_uart.cpp`, `dw300
 
 - `ex_00a` … `ex_06f`: ports of the Decawave reference examples (simple TX/RX, TX sleep, SS-TWR with and without STS, and AES).
 - `Makerfabs_*`: the original Makerfabs ranging and multi-anchor/multi-tag demos.
+- `stm32_custom_pin_test`: bring-up test for the custom F103RCT6 board (pin levels, bit-banged and driver DEV_ID, init, configure, one TX), logged over the board USB CDC port. Needs Tools > USB support: CDC.
 - `stm32_dwm3000_debug`: an SPI link test for STM32 that reports through LED blink codes on PC13 and USART1.
 - `ex_stm32_alive`: a minimal STM32 blink and UART sanity check.
 - `ex_dwm1000_*`: these use the separate **`DW1000`** library (arduino-dw1000), not this one, so they need that library installed.
@@ -63,9 +64,13 @@ A single-sided TWR setup in which one STM32 "logger" ranges against three respon
 | Sketch | Board | Poll func code / ID | Response | Reply delay |
 |---|---|---|---|---|
 | `ex_dwm3000_dwm1000_init` (initiator/logger), `ex_dwm3000_range_fast` (no pause, rate counter) | STM32F103C8T6 + DWM3000 | sends all three | — | — |
+| `ex_custom_board_init` (same initiator, USB CDC log, reply stats, `PEER_*` switches) | custom STM32F103RCT6 + DWM3000 | sends all three | — | — |
 | `ex_dwm3000_peer_resp` | STM32F103RCT6 + DWM3000 | `0xE2` `'DW3A'` | `0xE3` `'A3WD'` | 2.5 ms on F103xB/xC/xE, otherwise 30 ms |
+| `ex_custom_board_resp` (USB CDC log, stats) | custom STM32F103RCT6 + DWM3000 | `0xE2` `'DW3A'` | `0xE3` `'A3WD'` | 3 ms (reply prep measured 1.9 ms with `DW3000_STM32_BB_LOOPS` 2; it needs 20 ms at the default 40) |
 | `ex_dwm3000_wroom_resp` | ESP32-WROOM-32 + DW3000 | `0xE4` `'WR32'` | `0xE5` `'23RW'` | 2.5 ms |
 | `ex_dwm1000_range_resp` | ESP32-C3 + DWM1000 | `0xE0` `'WAVE'` | `0xE1` `'VEWA'` | about 1.5 ms |
+
+With two custom boards, one runs `ex_custom_board_init` and the other `ex_custom_board_resp` (peer `'3000'`). Run only one `'DW3A'` responder at a time: `ex_custom_board_resp` and `ex_dwm3000_peer_resp` answer the same poll.
 
 Invariants shared by these sketches. If you change one side, change the other.
 - Radio: channel 5, PLEN 128, PAC8, preamble code 9, **SFD = 0 (IEEE 8-symbol)** so that the DWM1000 can decode it, 6.8 Mb/s, STS off.
