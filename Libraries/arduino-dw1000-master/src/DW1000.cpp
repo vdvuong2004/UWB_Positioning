@@ -23,6 +23,9 @@
 DW1000Class DW1000;
 
 static void dwAlignSpi();
+#if defined(ARDUINO_ARCH_STM32)
+static void dwBitbangPins();
+#endif
 
 /* ###########################################################################
  * #### Static member variables ##############################################
@@ -183,10 +186,12 @@ void DW1000Class::begin(uint8_t irq, uint8_t rst) {
 	// and the remaining bytes read back as 0xFF.
 #if defined(ARDUINO_ARCH_ESP32)
 	SPI.begin(SCK, MISO, MOSI, -1);
+#elif defined(ARDUINO_ARCH_STM32)
+	dwBitbangPins();
 #else
 	SPI.begin();
 #endif
-#if !defined(ESP8266) && !defined(ARDUINO_ARCH_ESP32)
+#if !defined(ESP8266) && !defined(ARDUINO_ARCH_ESP32) && !defined(ARDUINO_ARCH_STM32)
 	SPI.usingInterrupt(digitalPinToInterrupt(irq));
 #endif
 	// pin and basic member setup
@@ -1694,6 +1699,44 @@ void DW1000Class::setSpiPins(uint8_t sck, uint8_t miso, uint8_t mosi) {
 	dwMiso = miso;
 	dwMosi = mosi;
 }
+#elif defined(ARDUINO_ARCH_STM32)
+/* STM32 hardware SPI was unreliable with the DW3000 on these boards, and the
+ * custom board puts the module on PB3/PB4/PB5, so bit-bang like the DW3000 port.
+ * Default pins are the STM32 SPI1 pins until setSpiPins() is called. */
+static PinName dwSckPn = NC;
+static PinName dwMisoPn = NC;
+static PinName dwMosiPn = NC;
+static uint8_t dwSck = SCK;
+static uint8_t dwMiso = MISO;
+static uint8_t dwMosi = MOSI;
+
+/* Half-clock wait. 8 gives about 1 MHz at 72 MHz, under the 3 MHz the DW1000
+ * allows before its PLL locks. */
+#ifndef DW1000_STM32_BB_LOOPS
+#define DW1000_STM32_BB_LOOPS 8
+#endif
+static inline void dwBbWait() {
+	for(volatile uint16_t n = 0; n < DW1000_STM32_BB_LOOPS; n++) {
+		__NOP();
+	}
+}
+
+void DW1000Class::setSpiPins(uint8_t sck, uint8_t miso, uint8_t mosi) {
+	dwSck = sck;
+	dwMiso = miso;
+	dwMosi = mosi;
+}
+
+static void dwBitbangPins() {
+	pinMode(dwSck, OUTPUT);
+	digitalWrite(dwSck, LOW);
+	pinMode(dwMosi, OUTPUT);
+	digitalWrite(dwMosi, LOW);
+	pinMode(dwMiso, INPUT);
+	dwSckPn = digitalPinToPinName(dwSck);
+	dwMisoPn = digitalPinToPinName(dwMiso);
+	dwMosiPn = digitalPinToPinName(dwMosi);
+}
 #else
 void DW1000Class::setSpiPins(uint8_t, uint8_t, uint8_t) {
 }
@@ -1717,7 +1760,23 @@ static uint8_t dwXfer(uint8_t data) {
 		return rx;
 	}
 #endif
+#if defined(ARDUINO_ARCH_STM32)
+	/* Sample MISO just before the rise. Before the PLL locks (19.2 MHz XTI), the
+	 * DW1000 already puts out the next bit soon after the rising edge, so a
+	 * sample after the rise read every byte shifted left by one bit. */
+	uint8_t rx = 0;
+	for(int bit = 7; bit >= 0; --bit) {
+		digitalWriteFast(dwMosiPn, (data & (1U << bit)) ? HIGH : LOW);
+		dwBbWait();
+		rx = (uint8_t)((rx << 1) | (digitalReadFast(dwMisoPn) ? 1U : 0U));
+		digitalWriteFast(dwSckPn, HIGH);
+		dwBbWait();
+		digitalWriteFast(dwSckPn, LOW);
+	}
+	return rx;
+#else
 	return SPI.transfer(data);
+#endif
 }
 
 static void dwSpiOpen() {
@@ -1725,6 +1784,7 @@ static void dwSpiOpen() {
 	if(!dwBitbang) {
 		SPI.beginTransaction(SPISettings(1000000L, MSBFIRST, dwMode));
 	}
+#elif defined(ARDUINO_ARCH_STM32)
 #else
 	SPI.beginTransaction(*DW1000Class::_currentSPI);
 #endif
@@ -1739,6 +1799,7 @@ static void dwSpiClose() {
 	if(!dwBitbang) {
 		SPI.endTransaction();
 	}
+#elif defined(ARDUINO_ARCH_STM32)
 #else
 	SPI.endTransaction();
 #endif

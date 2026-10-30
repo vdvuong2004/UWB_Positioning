@@ -14,6 +14,7 @@ const uint8_t PIN_MOSI = 6;
 const uint8_t PIN_SS = 7;
 
 volatile boolean received = false;
+volatile boolean rx_failed = false;
 
 static uint8_t tx_resp_msg[20] = {
     0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1,
@@ -37,7 +38,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 #endif
-  logLine("DWM1000 RESP v1.0");
+  logLine("DWM1000 RESP v1.1");
 
   DW1000.setSpiPins(PIN_SCK, PIN_MISO, PIN_MOSI);
   DW1000.begin(PIN_IRQ, PIN_RST);
@@ -60,12 +61,34 @@ void setup() {
   DW1000.commitConfiguration();
 
   DW1000.attachReceivedHandler(handleReceived);
+  /* Without this a bad frame (other UWB traffic nearby) stops the receiver for good. */
+  DW1000.attachReceiveFailedHandler(handleReceiveFailed);
   startListen();
   logLine("listening");
 }
 
 void handleReceived() {
   received = true;
+}
+
+void handleReceiveFailed() {
+  rx_failed = true;
+}
+
+/* Re-arm RX if the receiver went idle for any other reason. SYS_STATE bits
+ * 8..12 are the RX state, 0 = idle. */
+static void rxWatchdog() {
+  static uint32_t last = 0;
+  if (millis() - last < 50) {
+    return;
+  }
+  last = millis();
+  byte ss[4];
+  DW1000.readBytes(0x19, NO_SUB, ss, 4);
+  /* IRQ high means a frame just finished: leave it for handleInterrupt(). */
+  if ((ss[1] & 0x1F) == 0 && digitalRead(PIN_IRQ) == LOW) {
+    startListen();
+  }
 }
 
 static bool isPoll(const byte *data, uint16_t n) {
@@ -109,7 +132,12 @@ void loop() {
   if (digitalRead(PIN_IRQ) == HIGH) {
     DW1000.handleInterrupt();
   }
+  if (rx_failed) {
+    rx_failed = false;
+    startListen();
+  }
   if (!received) {
+    rxWatchdog();
     return;
   }
   received = false;

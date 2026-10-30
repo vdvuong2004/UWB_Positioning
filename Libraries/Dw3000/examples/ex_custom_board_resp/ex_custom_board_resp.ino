@@ -1,6 +1,6 @@
 #include "dw3000.h"
 
-#define APP_NAME "CUSTOM BOARD RANGE RESP v1.7"
+#define APP_NAME "CUSTOM BOARD RANGE RESP v1.6"
 /*
  * Custom STM32F103RCT6 + DWM3000 board as the SS-TWR responder '3000',
  * logged over the board's own USB port (USART1 PA9/PA10 gets the same text).
@@ -34,8 +34,8 @@ static dwt_config_t config = {
     (129 + 8 - 8), DWT_STS_MODE_OFF, DWT_STS_LEN_64, DWT_PDOA_M0
 };
 
-#define TX_ANT_DLY 16348
-#define RX_ANT_DLY 16348
+#define TX_ANT_DLY 16385
+#define RX_ANT_DLY 16385
 
 /* Poll RX to dwt_starttx measured 1.9 ms worst case with the custom board's
  * fast bit-bang (DW3000_STM32_BB_LOOPS 2); 3 ms leaves 1.5x margin. With the

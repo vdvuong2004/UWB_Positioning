@@ -1,7 +1,7 @@
 #include "dw3000.h"
 #include <math.h>
 
-#define APP_NAME "CUSTOM BOARD RANGE INIT v1.5"
+#define APP_NAME "CUSTOM BOARD RANGE INIT v1.4"
 /*
  * Custom STM32F103RCT6 + DWM3000 board as the SS-TWR initiator, logged over
  * the board's own USB port (USART1 PA9/PA10 gets the same text).
@@ -61,8 +61,8 @@ static dwt_config_t config = {
 
 #define RNG_DELAY_MS 500
 #define STATS_EVERY 20
-#define TX_ANT_DLY 16348
-#define RX_ANT_DLY 16348
+#define TX_ANT_DLY 16385
+#define RX_ANT_DLY 16385
 
 static uint8_t tx_poll_1000[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0xE0, 0, 0};
 static uint8_t rx_resp_1000[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
