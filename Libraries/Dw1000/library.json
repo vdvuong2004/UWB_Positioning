@@ -1,0 +1,9 @@
+{
+  "name": "DW1000",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "keywords": "uwb, dw1000, ranging",
+  "description": "DW1000 UWB driver for the UWB_Positioning boards (custom STM32F103RCT6, ESP32-C3). Based on thotro/arduino-dw1000.",
+  "frameworks": "arduino",
+  "platforms": ["ststm32", "espressif32"]
+}

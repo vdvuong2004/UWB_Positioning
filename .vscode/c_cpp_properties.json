@@ -6,7 +6,7 @@
     "esp32Tools": "${env:LOCALAPPDATA}/Arduino15/packages/esp32/tools",
     "uwbLibs": [
       "${workspaceFolder}/Libraries/Dw3000/src",
-      "${workspaceFolder}/Libraries/arduino-dw1000-master/src"
+      "${workspaceFolder}/Libraries/Dw1000/src"
     ]
   },
   "configurations": [

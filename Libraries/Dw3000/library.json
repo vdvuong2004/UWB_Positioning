@@ -1,9 +1,9 @@
 {
   "name": "DW3000",
-  "version": "0.1",
+  "version": "2.0.0",
   "license": "Apache-2.0",
-  "keywords": "wireless, communication",
-  "description": "A library that offers functionality to use Decawave's DW3000 chips.",
+  "keywords": "uwb, dw3000, ranging",
+  "description": "DW3000 UWB driver for the UWB_Positioning boards (custom STM32F103RCT6, ESP32, ESP32-C3).",
   "frameworks": "arduino",
-  "platforms": "*"
+  "platforms": ["ststm32", "espressif32"]
 }

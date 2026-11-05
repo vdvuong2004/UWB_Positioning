@@ -1,39 +1,14 @@
 /*
  * Board defaults for the DW3000 Arduino port.
  *
- * ESP32-C3 SuperMini pin configuration
+ * Pins are compiled into the library: a #define in a sketch does not reach
+ * the .cpp files. Change them here or with -D build flags.
  */
 
 #ifndef DW3000_BOARD_CONFIG_H_
 #define DW3000_BOARD_CONFIG_H_
 
-#if defined(ARDUINO_ARCH_NRF52)
-
-#ifndef DW3000_PIN_RST
-#define DW3000_PIN_RST 14
-#endif
-
-#ifndef DW3000_PIN_IRQ
-#define DW3000_PIN_IRQ 12
-#endif
-
-#ifndef DW3000_PIN_CS
-#define DW3000_PIN_CS 7
-#endif
-
-#ifndef DW3000_PIN_SCK
-#define DW3000_PIN_SCK 5
-#endif
-
-#ifndef DW3000_PIN_MOSI
-#define DW3000_PIN_MOSI 9
-#endif
-
-#ifndef DW3000_PIN_MISO
-#define DW3000_PIN_MISO 10
-#endif
-
-#elif defined(ARDUINO_ARCH_STM32) && defined(STM32F103xE)
+#if defined(ARDUINO_ARCH_STM32) && defined(STM32F103xE)
 
 // ============================================================
 // Custom STM32F103RCT6 board ("Generic F103RCTx") + DWM3000 on J7/J8

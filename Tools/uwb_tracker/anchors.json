@@ -1,0 +1,10 @@
+{
+  "_comment": "Keys are the anchor IDs (ANCHOR_ID in the anchor sketch, ANCHORS[] in uwb_tag). Positions in metres on the floor plan: measure them with a tape. bias_m is subtracted from every range of that anchor (antenna delay error): measured - true distance at a known spot.",
+  "anchors": {
+    "1": {"name": "1: C (DWM3000)", "x": 0.0, "y": 0.0, "bias_m": 0.0},
+    "2": {"name": "2: WROOM (DWM3000)", "x": 1.0, "y": 2.6, "bias_m": 0.0},
+    "3": {"name": "3: C3 (DWM1000)", "x": 0.0, "y": 3.5, "bias_m": 0.0}
+  },
+  "range_sigma_m": 0.12,
+  "accel_sigma_mps2": 0.5
+}

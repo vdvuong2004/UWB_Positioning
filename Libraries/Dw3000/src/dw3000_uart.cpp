@@ -1,8 +1,9 @@
 /*
- * UART.c
+ * Console used by every sketch (test_run_info).
+ * STM32: USART1 PA9/PA10, mirrored to the board's USB CDC port when enabled.
+ * ESP32: Serial, or printf when USB CDC On Boot is off.
  *
- * Makerfabs DW3000 Arduino port
- * Modified for ESP32-C3 SuperMini
+ * Based on the Makerfabs DW3000 Arduino port.
  */
 
 #include "dw3000_uart.h"

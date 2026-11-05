@@ -58,8 +58,6 @@ decaIrqStatus_t decamutexon(void)
 
 #if defined(ARDUINO_ARCH_ESP32)
     portENTER_CRITICAL(&my_mutex);
-#elif defined(ARDUINO_ARCH_NRF52)
-    portENTER_CRITICAL();
 #else
     portDISABLE_INTERRUPTS();
 #endif
@@ -94,8 +92,6 @@ void decamutexoff(decaIrqStatus_t s)        // put a function here that re-enabl
 
 #if defined(ARDUINO_ARCH_ESP32)
     portEXIT_CRITICAL(&my_mutex);
-#elif defined(ARDUINO_ARCH_NRF52)
-    portEXIT_CRITICAL();
 #else
     portENABLE_INTERRUPTS();
 #endif
