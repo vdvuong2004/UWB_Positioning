@@ -1,7 +1,7 @@
 #include "dw3000.h"
 #include <math.h>
 
-#define APP_NAME "UWB TAG v2.0"
+#define APP_NAME "UWB TAG v2.1"
 /*
  * UWB tag (SS-TWR initiator): custom STM32F103RCT6 board + DWM3000.
  * Polls every anchor in ANCHORS[] in turn and prints one line per range:
@@ -12,7 +12,8 @@
  * Tools > USB support: "CDC (generic 'Serial' supersede U(S)ART)".
  * Log and commands on the board's USB port (USART1 PA9/PA10 gets the same text).
  *
- * USB commands: p = pause/resume, z = zero stats, 1..9 = turn that anchor on/off.
+ * USB commands: p = pause/resume, z = zero stats, 1..9 = turn that anchor on/off,
+ *               f = next round period (100/50/20/10/0 ms) to find the max update rate.
  *
  * Protocol (same in uwb_anchor_dw3000 and uwb_anchor_dw1000, change all three together):
  *   radio  channel 5, PLEN 128, PAC 8, code 9, IEEE 8-symbol SFD, 6.8 Mb/s, STS off
@@ -47,9 +48,11 @@ static const anchor_t ANCHORS[] = {
 };
 #define N_ANCHORS (sizeof(ANCHORS) / sizeof(ANCHORS[0]))
 
-/* One round polls every anchor; then wait so a round takes this long. */
+/* One round polls every anchor; then wait so a round takes this long.
+ * 'f' steps through ROUND_PERIODS; 0 = poll back to back. */
 #define ROUND_PERIOD_MS 100
-#define STATS_EVERY_ROUNDS 50
+static const uint16_t ROUND_PERIODS[] = {100, 50, 20, 10, 0};
+#define STATS_PERIOD_MS 5000
 
 #define TX_ANT_DLY 16385
 #define RX_ANT_DLY 16385
@@ -101,7 +104,11 @@ struct anchor_stats_t {
   int max_cm;
 };
 static anchor_stats_t stats[N_ANCHORS];
+static uint16_t round_period_ms = ROUND_PERIOD_MS;
 static uint16_t rounds = 0;
+static uint32_t stats_start_ms = 0;
+/* Time of one good exchange (poll TX to distance), this stats window. */
+static uint32_t xchg_us_sum = 0, xchg_us_max = 0, xchg_n = 0;
 static uint16_t n_recover = 0;
 static bool paused = false;
 
@@ -148,7 +155,9 @@ static void banner(void)
   snprintf(line, sizeof(line), "tag id %u", TAG_ID);
   say(line);
   print_anchors();
-  say("commands: p = pause/resume, z = zero stats, 1..9 = anchor on/off");
+  snprintf(line, sizeof(line), "round period %u ms", round_period_ms);
+  say(line);
+  say("commands: p = pause/resume, z = zero stats, 1..9 = anchor on/off, f = round period");
 }
 
 /* spiSelect() pulses RSTn, so this is also the recovery path. */
@@ -206,6 +215,7 @@ void setup()
   if (!dw_start()) {
     halt("DW3000 START FAILED");
   }
+  reset_window();
   say("ranging");
 }
 
@@ -239,6 +249,7 @@ static void range_one(uint8_t idx)
 {
   const anchor_t *a = &ANCHORS[idx];
   anchor_stats_t *st = &stats[idx];
+  uint32_t t0 = micros();
   dwt_txconfig_t tx = {0x34, (uint32_t)a->tx_power * 0x01010101UL, 0x0};
   dwt_configuretxrf(&tx);
 
@@ -317,14 +328,41 @@ static void range_one(uint8_t idx)
   /* newlib-nano printf has no %f. */
   int cm = (int)(distance * 100.0 + (distance < 0 ? -0.5 : 0.5));
   record(st, cm);
+  uint32_t dt = micros() - t0;
+  xchg_us_sum += dt;
+  xchg_n++;
+  if (dt > xchg_us_max) {
+    xchg_us_max = dt;
+  }
   int abs_cm = cm < 0 ? -cm : cm;
   snprintf(line, sizeof(line), "DIST %u %s%d.%02d m", a->id, cm < 0 ? "-" : "", abs_cm / 100, abs_cm % 100);
   say(line);
 }
 
+/* Starts a new stats window (rates, spread, exchange time). */
+static void reset_window(void)
+{
+  for (uint8_t i = 0; i < N_ANCHORS; i++) {
+    stats[i].n = 0;
+    stats[i].sum = stats[i].sum_sq = 0;
+  }
+  rounds = 0;
+  xchg_us_sum = xchg_us_max = xchg_n = 0;
+  stats_start_ms = millis();
+}
+
 static void print_stats(void)
 {
   char line[96];
+  uint32_t elapsed = millis() - stats_start_ms;
+  if (elapsed == 0) {
+    elapsed = 1;
+  }
+  uint32_t round_x10 = rounds ? elapsed * 10 / rounds : 0;
+  snprintf(line, sizeof(line), "RATE period %u ms  round %lu.%lu ms  exchange avg %lu us max %lu us",
+           round_period_ms, (unsigned long)(round_x10 / 10), (unsigned long)(round_x10 % 10),
+           (unsigned long)(xchg_n ? xchg_us_sum / xchg_n : 0), (unsigned long)xchg_us_max);
+  say(line);
   int len = snprintf(line, sizeof(line), "STATS");
   for (uint8_t i = 0; i < N_ANCHORS && len < (int)sizeof(line); i++) {
     len += snprintf(line + len, sizeof(line) - len, "  %u %u/%u", ANCHORS[i].id, stats[i].replies, stats[i].polls);
@@ -343,12 +381,13 @@ static void print_stats(void)
     float var = st->sum_sq / st->n - mean * mean;
     int mean_cm = (int)(mean + (mean < 0 ? -0.5f : 0.5f));
     int std_cm = (int)(sqrtf(var > 0 ? var : 0) + 0.5f);
-    snprintf(line, sizeof(line), "SPREAD %u n %u  mean %d cm  std %d cm  min %d  max %d",
-             ANCHORS[i].id, st->n, mean_cm, std_cm, st->min_cm, st->max_cm);
+    uint32_t hz_x10 = (uint32_t)st->n * 10000UL / elapsed;
+    snprintf(line, sizeof(line), "SPREAD %u n %u  %lu.%lu Hz  mean %d cm  std %d cm  min %d  max %d",
+             ANCHORS[i].id, st->n, (unsigned long)(hz_x10 / 10), (unsigned long)(hz_x10 % 10),
+             mean_cm, std_cm, st->min_cm, st->max_cm);
     say(line);
-    st->n = 0;
-    st->sum = st->sum_sq = 0;
   }
+  reset_window();
 }
 
 static void handle_usb(void)
@@ -373,9 +412,20 @@ static void handle_usb(void)
       for (uint8_t i = 0; i < N_ANCHORS; i++) {
         stats[i].polls = stats[i].replies = 0;
       }
-      rounds = 0;
       n_recover = 0;
+      reset_window();
       say("stats zeroed");
+    } else if (c == 'f' || c == 'F') {
+      uint8_t n = sizeof(ROUND_PERIODS) / sizeof(ROUND_PERIODS[0]);
+      uint8_t k = 0;
+      while (k < n && ROUND_PERIODS[k] != round_period_ms) {
+        k++;
+      }
+      round_period_ms = ROUND_PERIODS[(k + 1) % n];
+      reset_window();
+      char line[32];
+      snprintf(line, sizeof(line), "round period %u ms", round_period_ms);
+      say(line);
     } else if (c >= '1' && c <= '9') {
       for (uint8_t i = 0; i < N_ANCHORS; i++) {
         if (ANCHORS[i].id == (uint16_t)(c - '0')) {
@@ -410,11 +460,11 @@ void loop()
     }
   }
 
-  if (++rounds >= STATS_EVERY_ROUNDS) {
+  rounds++;
+  if (millis() - stats_start_ms >= STATS_PERIOD_MS) {
     print_stats();
-    rounds = 0;
   }
-  while ((millis() - round_start) < ROUND_PERIOD_MS) {
+  while ((millis() - round_start) < round_period_ms) {
     handle_usb();
   }
 }

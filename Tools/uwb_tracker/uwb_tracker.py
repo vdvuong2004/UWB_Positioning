@@ -45,7 +45,9 @@ def load_config(path):
             "pos": np.array([float(a["x"]), float(a["y"])]),
             "bias": float(a.get("bias_m", 0.0)),
         }
-    return anchors, float(cfg.get("range_sigma_m", 0.12)), float(cfg.get("accel_sigma_mps2", 0.5))
+    map_size = cfg.get("map_size_m")
+    return (anchors, float(cfg.get("range_sigma_m", 0.12)), float(cfg.get("accel_sigma_mps2", 0.5)),
+            float(map_size) if map_size else None)
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +228,10 @@ class Tracker:
     # Restart the filter after this many clean fixes in a row disagree with it.
     DIVERGED_FIXES = 4
 
-    def __init__(self, anchors, range_sigma, accel_sigma):
+    def __init__(self, anchors, range_sigma, accel_sigma, raw=False):
         self.anchors = anchors
+        self.raw = raw  # no filter: the position is the least-squares fix itself
+        self.last_fix = None  # (pos, rms)
         self.range_sigma = range_sigma
         self.ekf = RangeEKF(range_sigma, accel_sigma)
         self.disagree = 0
@@ -248,6 +252,17 @@ class Tracker:
 
         # Raw fix from the latest range of every anchor heard in the last 1.5 s.
         fresh = [(self.anchors[k]["pos"], v[1]) for k, v in self.last.items() if t - v[0] < 1.5]
+        if self.raw:
+            if len(fresh) >= 3:
+                guess = self.last_fix[0] if self.last_fix is not None else self.centre
+                fix = least_squares_fix(np.array([f[0] for f in fresh]), np.array([f[1] for f in fresh]), guess)
+                if fix is not None:
+                    self.last_fix = fix
+                    self.fixes.append(fix[0])
+                    self.track.append(fix[0].copy())
+                    self.n_used += 1
+            return
+
         if len(fresh) >= 3:
             guess = self.ekf.x[:2] if self.ekf.x is not None else self.centre
             fix = least_squares_fix(np.array([f[0] for f in fresh]), np.array([f[1] for f in fresh]), guess)
@@ -281,7 +296,7 @@ class Tracker:
 # Plot
 # ---------------------------------------------------------------------------
 
-def run_plot(tracker, q, snapshot=None, snapshot_after=15.0):
+def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None):
     import matplotlib
     if snapshot:
         matplotlib.use("Agg")
@@ -292,14 +307,20 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0):
     anchors = tracker.anchors
     pts = np.array([a["pos"] for a in anchors.values()])
     margin = 1.0
-    fig, ax = plt.subplots(figsize=(8, 7))
+    fig, ax = plt.subplots(figsize=(13, 10))
+    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.06, top=0.95)
     ax.set_aspect("equal")
-    ax.set_xlim(pts[:, 0].min() - margin, pts[:, 0].max() + margin)
-    ax.set_ylim(pts[:, 1].min() - margin, pts[:, 1].max() + margin)
+    if map_size:  # fixed square view centred on the anchors
+        cx, cy = (pts.min(axis=0) + pts.max(axis=0)) / 2
+        ax.set_xlim(cx - map_size / 2, cx + map_size / 2)
+        ax.set_ylim(cy - map_size / 2, cy + map_size / 2)
+    else:
+        ax.set_xlim(pts[:, 0].min() - margin, pts[:, 0].max() + margin)
+        ax.set_ylim(pts[:, 1].min() - margin, pts[:, 1].max() + margin)
     ax.grid(True, alpha=0.3)
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
-    ax.set_title("UWB tag (board B): EKF position")
+    ax.set_title("UWB tag: raw least-squares position (no filter)" if tracker.raw else "UWB tag: EKF position")
 
     colors = ["tab:blue", "tab:green", "tab:purple", "tab:orange", "tab:brown"]
     circles = {}
@@ -312,8 +333,9 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0):
         circles[tag] = circ
 
     fix_dots, = ax.plot([], [], ".", color="0.6", markersize=4, label="least-squares fix (raw)")
-    trail, = ax.plot([], [], "-", color="tab:red", linewidth=1.5, alpha=0.7, label="EKF track")
-    tag_dot, = ax.plot([], [], "o", color="tab:red", markersize=11, label="tag (EKF)")
+    trail, = ax.plot([], [], "-", color="tab:red", linewidth=1.5, alpha=0.7,
+                     label="raw track" if tracker.raw else "EKF track")
+    tag_dot, = ax.plot([], [], "o", color="tab:red", markersize=11, label="tag (raw)" if tracker.raw else "tag (EKF)")
     ell = Ellipse((0, 0), 0, 0, fill=False, color="tab:red", alpha=0.6)
     ax.add_patch(ell)
     info = ax.text(0.01, 0.99, "", transform=ax.transAxes, va="top", family="monospace", fontsize=9,
@@ -339,7 +361,16 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0):
             f = np.array(tracker.fixes)
             fix_dots.set_data(f[:, 0], f[:, 1])
         lines = []
-        if tracker.ekf.x is not None:
+        if tracker.raw:
+            if tracker.last_fix is not None:
+                tr = np.array(tracker.track)
+                trail.set_data(tr[:, 0], tr[:, 1])
+                (x, y), rms = tracker.last_fix
+                tag_dot.set_data([x], [y])
+                lines.append(f"x {x:6.2f} m   y {y:6.2f} m   rms {rms:4.2f} m")
+            else:
+                lines.append("waiting for ranges from 3 anchors ...")
+        elif tracker.ekf.x is not None:
             tr = np.array(tracker.track)
             trail.set_data(tr[:, 0], tr[:, 1])
             x, y = tracker.ekf.x[:2]
@@ -359,7 +390,10 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0):
                 lines.append(f"{a['name']:<16} r {tracker.last[tag][1]:5.2f} m")
             else:
                 lines.append(f"{a['name']:<16} r   --")
-        lines.append(f"ranges used {tracker.n_used}  rejected {tracker.n_rejected}  restarts {tracker.n_restarts}")
+        if tracker.raw:
+            lines.append(f"fixes {tracker.n_used}")
+        else:
+            lines.append(f"ranges used {tracker.n_used}  rejected {tracker.n_rejected}  restarts {tracker.n_restarts}")
         info.set_text("\n".join(lines))
         return circles.values(), fix_dots, trail, tag_dot, ell, info
 
@@ -373,6 +407,11 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0):
         print(f"saved {snapshot}")
         return
     _anim = FuncAnimation(fig, frame, interval=100, cache_frame_data=False)
+    try:  # maximize once shown: plt.show() deiconifies the Tk window back to normal size
+        win = fig.canvas.manager.window
+        win.after(300, lambda: win.state("zoomed"))
+    except Exception:
+        pass
     plt.show()
 
 
@@ -384,6 +423,7 @@ def main():
     src.add_argument("--replay", help="log file written with --log")
     src.add_argument("--simulate", action="store_true", help="synthetic tag, no hardware")
     ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--raw", action="store_true", help="show the raw least-squares fix, no EKF")
     ap.add_argument("--config", default=os.path.join(here, "anchors.json"))
     ap.add_argument("--log", help="append raw serial lines (with time) to this file")
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed factor")
@@ -391,7 +431,7 @@ def main():
     ap.add_argument("--seconds", type=float, default=15.0)
     args = ap.parse_args()
 
-    anchors, range_sigma, accel_sigma = load_config(args.config)
+    anchors, range_sigma, accel_sigma, map_size = load_config(args.config)
     q = queue.Queue()
     stop = threading.Event()
     if args.port:
@@ -402,9 +442,9 @@ def main():
         target, targs = simulate_source, (anchors, range_sigma, q, stop)
     threading.Thread(target=target, args=targs, daemon=True).start()
 
-    tracker = Tracker(anchors, range_sigma, accel_sigma)
+    tracker = Tracker(anchors, range_sigma, accel_sigma, raw=args.raw)
     try:
-        run_plot(tracker, q, snapshot=args.snapshot, snapshot_after=args.seconds)
+        run_plot(tracker, q, snapshot=args.snapshot, snapshot_after=args.seconds, map_size=map_size)
     finally:
         stop.set()
 
