@@ -1,7 +1,7 @@
 #include <SPI.h>
 #include <DW1000.h>
 
-#define APP_NAME "UWB ANCHOR DW1000 v2.4"
+#define APP_NAME "UWB ANCHOR DW1000 v2.5"
 
 /*
  * UWB anchor (SS-TWR responder) with a DWM1000. Answers polls addressed to
@@ -18,8 +18,9 @@
  *     the log goes to the USB console through printf.
  *
  * Boot runs a board check (DEV_ID x1000, temperature, supply), then listens.
- * Every 10 s: STATS with replies, late replies, RX errors, other frames, the
- * worst reply prep time and a DEV_ID re-read (SPI health).
+ * Every 10 s: STATS with replies, late replies, RX errors, other frames, RX
+ * re-arms, frames found unhandled ("lost"), the worst reply prep time and a
+ * DEV_ID re-read (SPI health).
  * Commands: v = verbose on/off, z = zero stats, r = rerun the board check.
  *
  * Protocol: see uwb_tag. Change the tag and both anchor sketches together.
@@ -76,9 +77,9 @@ const uint8_t PIN_SS = 7;
 static byte resp_msg[RESP_DATA_LEN] = {FC_LO, FC_HI, 0, PAN_LO, PAN_HI, 0, 0,
                                        ANCHOR_ID & 0xFF, ANCHOR_ID >> 8, FUNC_RESP};
 
-volatile boolean received = false;
-volatile boolean rx_failed = false;
-volatile boolean rx_timeout = false;
+volatile bool received = false;
+volatile bool rx_failed = false;
+volatile bool rx_timeout = false;
 
 static bool verbose = false;
 static uint32_t n_resp = 0;
@@ -88,6 +89,7 @@ static uint32_t n_rx_to = 0;
 static uint32_t n_other = 0;
 static uint32_t n_tx_stuck = 0;
 static uint32_t n_rearm = 0;
+static uint32_t n_lost = 0;
 static uint32_t max_prep_us = 0;
 
 static void say(const char *text) {
@@ -104,6 +106,19 @@ static uint32_t read_dev_id() {
   byte id[4];
   DW1000.readBytes(DEV_ID, NO_SUB, id, 4);
   return ((uint32_t)id[3] << 24) | ((uint32_t)id[2] << 16) | ((uint32_t)id[1] << 8) | id[0];
+}
+
+/* SYS_STATUS bits that handleInterrupt() acts on. */
+static const uint32_t EVENT_MASK = (1UL << TXFRS_BIT) | (1UL << RXPHE_BIT) | (1UL << RXDFR_BIT) |
+                                   (1UL << RXFCG_BIT) | (1UL << RXFCE_BIT) | (1UL << RXRFSL_BIT) |
+                                   (1UL << RXRFTO_BIT) | (1UL << LDEERR_BIT) | (1UL << RXPTO_BIT) |
+                                   (1UL << RXSFDTO_BIT);
+static const uint32_t RX_DONE_MASK = (1UL << RXDFR_BIT) | (1UL << RXFCG_BIT);
+
+static uint32_t read_status() {
+  byte s[4];
+  DW1000.readBytes(SYS_STATUS, NO_SUB, s, 4);
+  return ((uint32_t)s[3] << 24) | ((uint32_t)s[2] << 16) | ((uint32_t)s[1] << 8) | s[0];
 }
 
 static void start_listen() {
@@ -291,9 +306,10 @@ static void print_stats() {
   }
   last = millis();
   char line[128];
-  snprintf(line, sizeof(line), "STATS resp %lu  late %lu  tx stuck %lu  rx err %lu  rx to %lu  other %lu  rearm %lu",
+  snprintf(line, sizeof(line), "STATS resp %lu  late %lu  tx stuck %lu  rx err %lu  rx to %lu  other %lu  rearm %lu  lost %lu",
            (unsigned long)n_resp, (unsigned long)n_late, (unsigned long)n_tx_stuck,
-           (unsigned long)n_rx_err, (unsigned long)n_rx_to, (unsigned long)n_other, (unsigned long)n_rearm);
+           (unsigned long)n_rx_err, (unsigned long)n_rx_to, (unsigned long)n_other, (unsigned long)n_rearm,
+           (unsigned long)n_lost);
   say(line);
   snprintf(line, sizeof(line), "  reply prep max %lu us (reply delay %u us)  DEV_ID %08lX",
            (unsigned long)max_prep_us, (unsigned)REPLY_DELAY_US, (unsigned long)read_dev_id());
@@ -318,7 +334,7 @@ static void handle_console() {
       verbose = !verbose;
       say(verbose ? "verbose on" : "verbose off");
     } else if (c == 'z') {
-      n_resp = n_late = n_rx_err = n_rx_to = n_other = n_tx_stuck = n_rearm = max_prep_us = 0;
+      n_resp = n_late = n_rx_err = n_rx_to = n_other = n_tx_stuck = n_rearm = n_lost = max_prep_us = 0;
       say("stats zeroed");
     } else if (c == 'r') {
       DW1000.idle();
@@ -346,6 +362,13 @@ static void rx_watchdog() {
       return;
     }
   }
+  /* RX idle with a frame done and IRQ low: an event nobody handled. Hand it to
+   * the library instead of throwing it away (a poll found here is late anyway). */
+  if (read_status() & RX_DONE_MASK) {
+    n_lost++;
+    DW1000.handleInterrupt();
+    return;
+  }
   n_rearm++;
   start_listen();
 }
@@ -355,10 +378,19 @@ void loop() {
   handle_console();
   print_stats();
 
-  /* IRQ pin first; also read the status every 5 ms in case the pin is not wired. */
-  if (digitalRead(PIN_IRQ) == HIGH || (millis() - last_poll) >= 5) {
+  /* IRQ pin first; also check the status every 5 ms in case the pin is not wired.
+   * handleInterrupt() reads SYS_STATUS once and then clears every bit: called on a
+   * timer it wiped a frame that finished in between, RX stayed idle without any
+   * event and the watchdog re-armed it ~9% of the rounds (= the tag's misses).
+   * So the timer path calls it only when an event is already pending. */
+  if (digitalRead(PIN_IRQ) == HIGH) {
     last_poll = millis();
     DW1000.handleInterrupt();
+  } else if ((millis() - last_poll) >= 5) {
+    last_poll = millis();
+    if (read_status() & EVENT_MASK) {
+      DW1000.handleInterrupt();
+    }
   }
   if (rx_timeout) {
     rx_timeout = false;

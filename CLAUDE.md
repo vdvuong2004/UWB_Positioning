@@ -67,6 +67,9 @@ Custom boards log on their own USB CDC port; open it with DTR set or the sketch 
 - The DW1000 anchor must re-arm RX after an RX error (`attachReceiveFailedHandler` + watchdog); without it one bad
   frame from other UWB traffic stops the receiver for good. Also attach the timeout handler (an SFD timeout stops RX too)
   and keep the watchdog at 10 ms: at 50 ms its ~0.7 silent RX stops/s cost ~3% of the polls.
+  Never call `DW1000.handleInterrupt()` on a timer without a pending event: it reads SYS_STATUS once and then
+  clears every bit, so a frame finishing in between is wiped and RX stays idle (v2.4 lost ~9% of the polls this
+  way; v2.5 checks the status first, `rearm` went 1005 -> 0, anchor 2 replies 99.8%).
 - ESP32-WROOM GPIO 6–11 are flash pins.
 
 ## Hardware history (for debugging)
