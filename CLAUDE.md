@@ -6,7 +6,7 @@ This file guides Claude Code when it works in this repository.
 
 UWB indoor positioning. A tag (custom STM32F103RCT6 board + DWM3000) runs single-sided
 TWR against several anchors (DWM3000 or DWM1000) in a fixed 25 ms frame, compensates (`scale·d − bias`)
-and IIR-filters each range on the tag, and prints `DIST <id> <filtered m> m raw <raw m>` (USB only).
+median-5 + IIR + 2 cm dead band filters each range on the tag, and prints `DIST <id> <filtered m> m raw <raw m>` (USB only).
 `Tools/uwb_tracker` (Python) reads those lines, runs an EKF and draws a 2D map.
 The user-facing overview is `README.md` (Vietnamese). Talk to the user in Vietnamese.
 

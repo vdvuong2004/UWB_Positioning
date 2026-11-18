@@ -61,9 +61,11 @@ python uwb_tracker.py --simulate                  tag giả lập, không cần 
 Xử lý trên tag (`uwb_tag` v3.0), mỗi khung cố định 25 ms (40 Hz):
 1. Đo cả 3 anchor. Gói trượt chỉ được thử lại khi khung còn đủ thời gian.
 2. Bù sai số: `d_bù = scale·d_đo − bias_m`.
-3. Lọc IIR bậc 1: `d_lọc[n] = alpha·d_bù[n] + (1 − alpha)·d_lọc[n−1]`. Giá trị lệch quá 0.5 m trong một khung
-   (gai do phản xạ) bị bỏ; lệch 4 khung liên tiếp thì bộ lọc lấy luôn giá trị mới.
-4. In `DIST <id> <d_lọc> m raw <d_đo>`. Mỗi 5 s, dòng `SPREAD` cho std của khoảng cách
+3. Trung vị 5 mẫu gần nhất (loại gai, số đo nhảy mức do phản xạ/NLOS).
+4. Lọc IIR bậc 1: `d_lọc[n] = alpha·d_trungvị[n] + (1 − alpha)·d_lọc[n−1]`. Giá trị lệch quá 0.5 m
+   trong một khung bị bỏ; lệch 4 khung liên tiếp thì bộ lọc lấy luôn giá trị mới.
+5. Vùng chết ±2 cm: đầu ra chỉ đổi khi `d_lọc` ra khỏi ±2 cm quanh nó, nên tag đứng yên cho số ổn định.
+6. In `DIST <id> <d_lọc> m raw <d_đo>`. Mỗi 5 s, dòng `SPREAD` cho std của khoảng cách
    thô (`std`) và sau lọc (`filt std`); dòng `IIR` cho số gai bị bỏ và số khung bị vượt.
 
 Tag v3.0 không còn EKF (dòng `POS`); vị trí do EKF trên máy tính tính.

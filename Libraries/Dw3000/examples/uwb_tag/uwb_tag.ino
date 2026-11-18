@@ -2,14 +2,17 @@
 #include <math.h>
 #include <stdlib.h>
 
-#define APP_NAME "UWB TAG v3.1"
+#define APP_NAME "UWB TAG v3.2"
 /*
  * UWB tag (SS-TWR initiator): custom STM32F103RCT6 board + DWM3000.
  * Fixed frame (ROUND_PERIOD_MS, 25 ms = 40 Hz):
  *   1. range every anchor in ANCHORS[] (a miss is retried only while the frame has time),
  *   2. compensate:  d_comp = scale * d_raw - bias   (per anchor, from calibration),
- *   3. IIR low-pass: d_filt[n] = alpha * d_comp[n] + (1 - alpha) * d_filt[n-1], with a jump gate,
- *   4. print one line per anchor ranged in this frame:
+ *   3. median of the last MEDIAN_N compensated ranges (removes spikes and mode jumps),
+ *   4. IIR low-pass: d_filt[n] = alpha * d_med[n] + (1 - alpha) * d_filt[n-1], with a jump gate,
+ *   5. dead band: the output moves only when d_filt leaves +-DEADBAND_M around it,
+ *      so a tag standing still gives a steady value,
+ *   6. print one line per anchor ranged in this frame:
  *        DIST <anchor id> <d_filt> m raw <d_raw>
  * TX power adapts per anchor (see PWR_LADDER); "PWR <id> <hex>" marks a change.
  * Tools/uwb_tracker reads these lines and draws the 2D map.
@@ -96,6 +99,12 @@ static float iir_alpha = IIR_ALPHA;
 #define JUMP_M 0.5f
 #define JUMP_RESET 4
 #define IIR_STALE_MS 500
+/* Median before the IIR: an IIR smears a 30 cm spike over many frames, a median
+ * of 5 drops it (and a NLOS mode jump that lasts < 3 frames) for ~2 frames of lag. */
+#define MEDIAN_N 5
+/* Dead band after the IIR: the filtered value still wanders ~1 cm per frame when
+ * the tag stands still. Moving, the output trails the filter by at most this. */
+#define DEADBAND_M 0.02f
 
 /* One round polls every anchor; then wait so a round takes this long.
  * 'f' steps through ROUND_PERIODS; 0 = poll back to back. */
@@ -172,6 +181,9 @@ struct anchor_stats_t {
   bool y_ok;
   uint8_t jump_row;
   uint32_t y_ms;
+  float med_buf[MEDIAN_N]; /* last compensated ranges, ring buffer */
+  uint8_t med_n, med_i;
+  float out; /* dead-band output, what DIST prints */
   /* Adaptive power state (kept across windows). */
   uint8_t lvl;
   uint8_t strong_row;
@@ -517,7 +529,40 @@ static bool range_one(uint8_t idx)
   return true;
 }
 
-/* Steps 2-4 of the frame: compensate, IIR-filter and print every range of this frame. */
+/* Median of the last med_n compensated ranges of one anchor. */
+static float median_push(anchor_stats_t *st, float d)
+{
+  st->med_buf[st->med_i] = d;
+  st->med_i = (st->med_i + 1) % MEDIAN_N;
+  if (st->med_n < MEDIAN_N) {
+    st->med_n++;
+  }
+  float v[MEDIAN_N];
+  uint8_t n = st->med_n;
+  for (uint8_t k = 0; k < n; k++) {
+    float x = st->med_buf[k];
+    int8_t j = k - 1;
+    while (j >= 0 && v[j] > x) {
+      v[j + 1] = v[j];
+      j--;
+    }
+    v[j + 1] = x;
+  }
+  return (n & 1) ? v[n / 2] : 0.5f * (v[n / 2 - 1] + v[n / 2]);
+}
+
+/* (Re)starts one anchor's filter chain at d. */
+static void filter_restart(anchor_stats_t *st, float d, uint32_t now)
+{
+  st->med_n = st->med_i = 0;
+  median_push(st, d);
+  st->y = st->out = d;
+  st->y_ok = true;
+  st->jump_row = 0;
+  st->y_ms = now;
+}
+
+/* Steps 2-6 of the frame: compensate, median, IIR, dead band, print. */
 static void iir_frame(void)
 {
   uint32_t now = millis();
@@ -529,30 +574,33 @@ static void iir_frame(void)
     anchor_stats_t *st = &stats[i];
     float d = comp[i].scale * rng_m[i] - comp[i].bias;
     if (!st->y_ok || now - st->y_ms > IIR_STALE_MS) {
-      st->y = d;
-      st->y_ok = true;
-      st->jump_row = 0;
-      st->y_ms = now;
-    } else if (fabsf(d - st->y) > JUMP_M) {
-      if (++st->jump_row >= JUMP_RESET) {
-        st->y = d;
+      filter_restart(st, d, now);
+    } else {
+      float m = median_push(st, d);
+      if (fabsf(m - st->y) > JUMP_M) {
+        if (++st->jump_row >= JUMP_RESET) {
+          filter_restart(st, d, now);
+          n_jump_reset++;
+        } else {
+          n_jump++; /* keep the old value, but still report it below */
+        }
+      } else {
+        st->y = iir_alpha * m + (1.0f - iir_alpha) * st->y;
         st->jump_row = 0;
         st->y_ms = now;
-        n_jump_reset++;
-      } else {
-        n_jump++; /* keep the old value, but still report it below */
       }
-    } else {
-      st->y = iir_alpha * d + (1.0f - iir_alpha) * st->y;
-      st->jump_row = 0;
-      st->y_ms = now;
+      if (st->y - st->out > DEADBAND_M) {
+        st->out = st->y - DEADBAND_M;
+      } else if (st->out - st->y > DEADBAND_M) {
+        st->out = st->y + DEADBAND_M;
+      }
     }
-    float y_cm = st->y * 100.0f;
+    float y_cm = st->out * 100.0f;
     st->fsum += y_cm;
     st->fsum_sq += y_cm * y_cm;
     if (print_dist) {
       int len = snprintf(line, sizeof(line), "DIST %u ", ANCHORS[i].id);
-      len += put_fixed(line + len, sizeof(line) - len, st->y);
+      len += put_fixed(line + len, sizeof(line) - len, st->out);
       len += snprintf(line + len, sizeof(line) - len, " m raw ");
       put_fixed(line + len, sizeof(line) - len, rng_m[i]);
       say(line);
