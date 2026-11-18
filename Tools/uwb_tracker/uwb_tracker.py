@@ -2,10 +2,10 @@
 UWB tag tracker: ranges from the tag (board B) -> Kalman filter -> live 2D map.
 
 The tag (uwb_tag in the Dw3000 library examples) prints one line per range:
-    DIST 1 1.29 m
-    DIST 2 0.84 m
-    DIST 3 0.59 m
-This script reads those lines from its USB serial port, runs an extended
+    DIST 1 1.29 m raw 1.33
+The first number is the range after the tag's compensation and IIR filter
+(uwb_tag v3.0+); lines without "raw" (older tags) are raw ranges and get
+bias_m subtracted here. This script reads those lines from its USB serial port, runs an extended
 Kalman filter (state x, y, vx, vy; constant-velocity model) that is updated
 with every single range, and draws the anchors, the range circles, the raw
 least-squares fixes and the filtered track.
@@ -15,8 +15,12 @@ Usage:
     python uwb_tracker.py --port COM6 --log run.txt   live, and save the raw lines
     python uwb_tracker.py --replay run.txt            play a saved run back
     python uwb_tracker.py --simulate                  synthetic tag, no hardware
+    add --raw to show the unfiltered least-squares fix instead of the EKF
 
-Anchor positions, per-anchor range bias and noise settings: anchors.json.
+Live: press f in the map window to step the tag's round period (25/100/50/20/10/0 ms).
+
+Anchor positions, per-anchor range compensation (scale, bias_m), the tag's IIR
+coefficient (iir_alpha) and noise settings: anchors.json.
 """
 
 import argparse
@@ -31,8 +35,16 @@ from collections import deque
 
 import numpy as np
 
-DIST_RE = re.compile(r"DIST\s+(\S+)\s+(-?\d+(?:\.\d+)?)\s*m")
+# Group 3 set: the tag already compensated and filtered the range (uwb_tag v3.0+).
+DIST_RE = re.compile(r"DIST\s+(\S+)\s+(-?\d+(?:\.\d+)?)\s*m(\s+raw\b)?")
 ANCHORS_RE = re.compile(r"anchors:(.*)")
+PERIOD_RE = re.compile(r"round period (\d+) ms")
+RATE_RE = re.compile(r"RATE period (\d+) ms\s+round ([\d.]+) ms")
+SPREAD_RE = re.compile(r"SPREAD (\S+) n \d+\s+([\d.]+) Hz")
+# On-tag filter output (uwb_tag v2.3+): POS <x> <y> v <vx> <vy> used n/m [fix x y]
+POS_RE = re.compile(r"POS\s+(-?[\d.]+)\s+(-?[\d.]+)\s+v\s+(-?[\d.]+)\s+(-?[\d.]+)")
+FILTER_RE = re.compile(r"FILTER avg (\d+) us max (\d+) us.*overrun (\d+)")
+TAG_POS = "@POS"  # queue key for POS lines, never an anchor ID
 
 
 def load_config(path):
@@ -44,10 +56,11 @@ def load_config(path):
             "name": a.get("name", tag),
             "pos": np.array([float(a["x"]), float(a["y"])]),
             "bias": float(a.get("bias_m", 0.0)),
+            "scale": float(a.get("scale", 1.0)),
         }
     map_size = cfg.get("map_size_m")
     return (anchors, float(cfg.get("range_sigma_m", 0.12)), float(cfg.get("accel_sigma_mps2", 0.5)),
-            float(map_size) if map_size else None)
+            float(map_size) if map_size else None, float(cfg.get("iir_alpha", 0.1)))
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +78,16 @@ def open_serial(port, baud):
     return ser
 
 
-def serial_source(ser, out, anchors, log_path, stop):
+def send_compensation(ser, anchors, iir_alpha):
+    """Give the tag its per-anchor range compensation and IIR coefficient (uwb_tag v3.0+)."""
+    for tag, a in anchors.items():
+        if tag.isdigit():
+            ser.write(f"C{tag} {a['scale']:.4f} {a['bias']:.3f}\n".encode())
+            time.sleep(0.02)
+    ser.write(f"L{iir_alpha:.3f}\n".encode())
+
+
+def serial_source(ser, out, anchors, log_path, stop, tag_info, iir_alpha):
     # Line-buffered: this thread is a daemon and may be killed without close().
     log = open(log_path, "a", encoding="utf-8", buffering=1) if log_path else None
     t0 = time.monotonic()
@@ -82,7 +104,32 @@ def serial_source(ser, out, anchors, log_path, stop):
                     log.write(f"{t:.3f} {line}\n")
                 m = DIST_RE.search(line)
                 if m:
-                    out.put((t, m.group(1), float(m.group(2))))
+                    out.put((t, m.group(1), float(m.group(2)), bool(m.group(3))))
+                    continue
+                m = POS_RE.search(line)
+                if m:
+                    out.put((t, TAG_POS, tuple(float(g) for g in m.groups()), False))
+                    continue
+                m = FILTER_RE.search(line)
+                if m:
+                    tag_info["filter"] = tuple(int(g) for g in m.groups())
+                    continue
+                # Rate report of the tag (uwb_tag v2.1+), shown on the map.
+                m = PERIOD_RE.search(line)
+                if m:
+                    tag_info["period"] = int(m.group(1))
+                    tag_info["round"] = None
+                    tag_info["hz"] = {}
+                    print(f"[serial] {line}")
+                    continue
+                m = RATE_RE.search(line)
+                if m:
+                    tag_info["period"] = int(m.group(1))
+                    tag_info["round"] = float(m.group(2))
+                    continue
+                m = SPREAD_RE.search(line)
+                if m:
+                    tag_info.setdefault("hz", {})[m.group(1)] = float(m.group(2))
                     continue
                 m = ANCHORS_RE.search(line)
                 if m:
@@ -94,6 +141,7 @@ def serial_source(ser, out, anchors, log_path, stop):
                             ser.write(tag.encode())
                             asked.add(tag)
                             time.sleep(0.05)
+                    send_compensation(ser, anchors, iir_alpha)
                     print(f"[serial] {line}")
     finally:
         ser.close()
@@ -115,12 +163,17 @@ def replay_source(path, out, speed, stop):
             except ValueError:
                 continue
             m = DIST_RE.search(parts[1])
-            if not m:
-                continue
+            if m:
+                item = (t, m.group(1), float(m.group(2)), bool(m.group(3)))
+            else:
+                m = POS_RE.search(parts[1])
+                if not m:
+                    continue
+                item = (t, TAG_POS, tuple(float(g) for g in m.groups()), False)
             wait = t / speed - (time.monotonic() - t_start)
             if wait > 0:
                 time.sleep(wait)
-            out.put((t, m.group(1), float(m.group(2))))
+            out.put(item)
 
 
 def simulate_source(anchors, sigma, out, stop):
@@ -138,7 +191,7 @@ def simulate_source(anchors, sigma, out, stop):
             r = np.linalg.norm(p - a["pos"]) + a["bias"] + rng.normal(0, sigma)
             if rng.random() < 0.03:
                 r += rng.uniform(0.5, 1.5)  # occasional NLOS-like outlier
-            out.put((t, tag, max(r, 0.0)))
+            out.put((t, tag, max(r, 0.0), False))
             time.sleep(0.5 / 3)
 
 
@@ -240,14 +293,20 @@ class Tracker:
         self.fixes = deque(maxlen=60)
         self.track = deque(maxlen=300)
         self.n_used = self.n_rejected = self.n_unknown = 0
+        self.tag_pos = None  # (x, y, vx, vy) from the tag's own filter
+        self.tag_track = deque(maxlen=300)
         self.centre = np.mean([a["pos"] for a in anchors.values()], axis=0)
 
-    def add(self, t, tag, r_raw):
+    def add(self, t, tag, r_raw, compensated=False):
+        if tag == TAG_POS:
+            self.tag_pos = r_raw
+            self.tag_track.append(r_raw[:2])
+            return
         a = self.anchors.get(tag)
         if a is None:
             self.n_unknown += 1
             return
-        r = r_raw - a["bias"]
+        r = r_raw if compensated else r_raw - a["bias"]
         self.last[tag] = (t, r)
 
         # Raw fix from the latest range of every anchor heard in the last 1.5 s.
@@ -296,11 +355,14 @@ class Tracker:
 # Plot
 # ---------------------------------------------------------------------------
 
-def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None):
+def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None, ser=None, tag_info=None):
     import matplotlib
     if snapshot:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    # 'f' is matplotlib's fullscreen key; here it steps the tag's round period.
+    plt.rcParams["keymap.fullscreen"] = [k for k in plt.rcParams["keymap.fullscreen"] if k != "f"]
+    tag_info = tag_info if tag_info is not None else {}
     from matplotlib.animation import FuncAnimation
     from matplotlib.patches import Circle, Ellipse
 
@@ -336,20 +398,28 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None):
     trail, = ax.plot([], [], "-", color="tab:red", linewidth=1.5, alpha=0.7,
                      label="raw track" if tracker.raw else "EKF track")
     tag_dot, = ax.plot([], [], "o", color="tab:red", markersize=11, label="tag (raw)" if tracker.raw else "tag (EKF)")
+    board_trail, = ax.plot([], [], "-", color="tab:orange", linewidth=1.5, alpha=0.8, label="on-tag filter track")
+    board_dot, = ax.plot([], [], "s", color="tab:orange", markersize=9, label="on-tag filter (POS)")
     ell = Ellipse((0, 0), 0, 0, fill=False, color="tab:red", alpha=0.6)
     ax.add_patch(ell)
     info = ax.text(0.01, 0.99, "", transform=ax.transAxes, va="top", family="monospace", fontsize=9,
                    bbox=dict(boxstyle="round", fc="white", alpha=0.8))
     ax.legend(loc="lower right", fontsize=8)
 
+    def on_key(event):
+        if event.key == "f" and ser is not None:
+            ser.write(b"f")
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+
     def drain():
         n = 0
         while True:
             try:
-                t, tag, r = q.get_nowait()
+                t, tag, r, comp = q.get_nowait()
             except queue.Empty:
                 return n
-            tracker.add(t, tag, r)
+            tracker.add(t, tag, r, comp)
             n += 1
 
     def frame(_):
@@ -385,17 +455,32 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None):
             lines.append(f"x {x:6.2f} m   y {y:6.2f} m   v {speed:4.2f} m/s")
         else:
             lines.append("waiting for ranges from 3 anchors ...")
+        if tracker.tag_pos is not None:
+            bt = np.array(tracker.tag_track)
+            board_trail.set_data(bt[:, 0], bt[:, 1])
+            bx, by, bvx, bvy = tracker.tag_pos
+            board_dot.set_data([bx], [by])
+            lines.append(f"on-tag x {bx:6.2f} m   y {by:6.2f} m   v {math.hypot(bvx, bvy):4.2f} m/s")
+        hz = tag_info.get("hz", {})
         for tag, a in anchors.items():
+            rate = f"  {hz[tag]:4.1f} Hz" if tag in hz else ""
             if tag in tracker.last:
-                lines.append(f"{a['name']:<16} r {tracker.last[tag][1]:5.2f} m")
+                lines.append(f"{a['name']:<16} r {tracker.last[tag][1]:5.2f} m{rate}")
             else:
-                lines.append(f"{a['name']:<16} r   --")
+                lines.append(f"{a['name']:<16} r   --{rate}")
+        if "period" in tag_info:
+            rnd = tag_info.get("round")
+            rnd = f"{rnd:.1f} ms" if rnd is not None else "(measuring, 5 s)"
+            lines.append(f"tag period {tag_info['period']} ms  round {rnd}  [f = change]")
+        if "filter" in tag_info:
+            avg, mx, over = tag_info["filter"]
+            lines.append(f"on-tag filter {avg} us (max {mx})  overrun {over} / 5 s")
         if tracker.raw:
             lines.append(f"fixes {tracker.n_used}")
         else:
             lines.append(f"ranges used {tracker.n_used}  rejected {tracker.n_rejected}  restarts {tracker.n_restarts}")
         info.set_text("\n".join(lines))
-        return circles.values(), fix_dots, trail, tag_dot, ell, info
+        return circles.values(), fix_dots, trail, tag_dot, board_trail, board_dot, ell, info
 
     if snapshot:
         t_end = time.monotonic() + snapshot_after
@@ -431,11 +516,14 @@ def main():
     ap.add_argument("--seconds", type=float, default=15.0)
     args = ap.parse_args()
 
-    anchors, range_sigma, accel_sigma, map_size = load_config(args.config)
+    anchors, range_sigma, accel_sigma, map_size, iir_alpha = load_config(args.config)
     q = queue.Queue()
+    ser = None
+    tag_info = {}
     stop = threading.Event()
     if args.port:
-        target, targs = serial_source, (open_serial(args.port, args.baud), q, anchors, args.log, stop)
+        ser = open_serial(args.port, args.baud)
+        target, targs = serial_source, (ser, q, anchors, args.log, stop, tag_info, iir_alpha)
     elif args.replay:
         target, targs = replay_source, (args.replay, q, args.speed, stop)
     else:
@@ -444,7 +532,8 @@ def main():
 
     tracker = Tracker(anchors, range_sigma, accel_sigma, raw=args.raw)
     try:
-        run_plot(tracker, q, snapshot=args.snapshot, snapshot_after=args.seconds, map_size=map_size)
+        run_plot(tracker, q, snapshot=args.snapshot, snapshot_after=args.seconds, map_size=map_size,
+                 ser=ser, tag_info=tag_info)
     finally:
         stop.set()
 

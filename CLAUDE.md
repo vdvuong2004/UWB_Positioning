@@ -5,7 +5,8 @@ This file guides Claude Code when it works in this repository.
 ## What this is
 
 UWB indoor positioning. A tag (custom STM32F103RCT6 board + DWM3000) runs single-sided
-TWR against several anchors (DWM3000 or DWM1000) and prints `DIST <id> <m> m`.
+TWR against several anchors (DWM3000 or DWM1000) in a fixed 25 ms frame, compensates (`scale·d − bias`)
+and IIR-filters each range on the tag, and prints `DIST <id> <filtered m> m raw <raw m>` (USB only).
 `Tools/uwb_tracker` (Python) reads those lines, runs an EKF and draws a 2D map.
 The user-facing overview is `README.md` (Vietnamese). Talk to the user in Vietnamese.
 
@@ -39,11 +40,14 @@ Custom boards log on their own USB CDC port; open it with DTR set or the sketch 
 - Poll (12 B incl. CRC): `41 88 seq CA DE dst src E0`. Resp (20 B incl. CRC): `41 88 seq CA DE dst src E1 poll_rx_ts(4) resp_tx_ts(4)`.
   Addresses 16-bit LE; anchors 1.., tag 100. The anchor copies seq; the tag checks seq, dst, src and func.
 - Anchors reply exactly `REPLY_DELAY_US` = 3000 after the poll RX timestamp. The custom board needs 1.9 ms
-  of prep with `DW3000_STM32_BB_LOOPS` 2. Tag: RX opens 2000 uus after TX, timeout 10000 uus.
+  of prep with `DW3000_STM32_BB_LOOPS` 2 (DW1000 anchor: DX_TIME = poll RX ts + delay, not `setDelay()`, which counts
+  from now). Tag: RX opens 2000 uus after TX, timeout 4000 uus; a miss is retried at once (`max_tries`, cmd `r`).
 - The DW3000 response buffer is 20 bytes: 19 clips the TX timestamp. The DW1000 library's
   `getDataLength()` excludes the 2 CRC bytes (poll = 10).
-- TX power: tag → DWM3000 anchors `0x48`, → DWM1000 `0xC0` (`ANCHORS[]` in `uwb_tag`); `0xC0` saturates a
-  nearby DWM3000 so it never decodes. DW3000 anchor replies at `0x48` on STM32, `0x80` on the WROOM test board.
+- TX power adapts (tag v2.5 / DW3000 anchor v2.2): the tag steps each anchor through `PWR_LADDER` {0x48, 0x80, 0xC0, 0xFD}
+  (up on a miss, wrapping to the bottom; down after 20 replies above -75 dBm), start 0x48 for DWM3000, 0xC0 for DWM1000.
+  `0xC0` saturates a nearby DWM3000 so it never decodes. The DW3000 anchor replies at 0xFD when the poll is below
+  -85 dBm, else at its low `TX_POWER` (0x48 STM32, 0x80 WROOM). RX level = DW3000 manual 4.7.2 (IP_DIAG_1/12, DGC 0x30060).
 - Antenna delay: DW3000 16385, DW1000 16436 (not calibrated per module yet; `bias_m` in `anchors.json` covers it).
 
 ## Platform details that are easy to break
@@ -61,7 +65,8 @@ Custom boards log on their own USB CDC port; open it with DTR set or the sketch 
   On Boot is off (ESP32-C3).
 - RSTn is open-drain: drive low, release to `INPUT_PULLUP`, never drive high.
 - The DW1000 anchor must re-arm RX after an RX error (`attachReceiveFailedHandler` + watchdog); without it one bad
-  frame from other UWB traffic stops the receiver for good.
+  frame from other UWB traffic stops the receiver for good. Also attach the timeout handler (an SFD timeout stops RX too)
+  and keep the watchdog at 10 ms: at 50 ms its ~0.7 silent RX stops/s cost ~3% of the polls.
 - ESP32-WROOM GPIO 6–11 are flash pins.
 
 ## Hardware history (for debugging)

@@ -1,11 +1,12 @@
 {
-  "_comment": "Keys are the anchor IDs (ANCHOR_ID in the anchor sketch, ANCHORS[] in uwb_tag). Positions in metres on the floor plan: measure them with a tape. bias_m is subtracted from every range of that anchor (antenna delay error): measured - true distance at a known spot. map_size_m: side of the square map view in metres, centred on the anchors (remove it to fit the anchors).",
+  "_comment": "Keys are the anchor IDs (ANCHOR_ID in the anchor sketch, ANCHORS[] in uwb_tag). Positions in metres on the floor plan: measure them with a tape. bias_m is subtracted from every range of that anchor (antenna delay error): measured - true distance at a known spot. Optional per-anchor scale (default 1): the tag computes d = scale * d_measured - bias_m. iir_alpha: the tag's IIR coefficient (0..1, 1 = no filtering). map_size_m: side of the square map view in metres, centred on the anchors (remove it to fit the anchors).",
   "anchors": {
     "1": {"name": "1: C (DWM3000)", "x": 0.0, "y": 4.2, "bias_m": 0.0},
-    "2": {"name": "2: STM32 (DWM3000)", "x": 0.0, "y": 0.0, "bias_m": 0.0},
-    "3": {"name": "3: C3 (DWM1000)", "x": -5.0, "y": 0.0, "bias_m": 0.0}
+    "2": {"name": "2: A (DWM1000)", "x": 0.0, "y": 0.0, "bias_m": 0.0},
+    "3": {"name": "3: STM32 moi (DWM3000)", "x": -5.0, "y": 0.0, "bias_m": 0.0}
   },
   "map_size_m": 9.0,
   "range_sigma_m": 0.12,
-  "accel_sigma_mps2": 0.5
+  "accel_sigma_mps2": 0.5,
+  "iir_alpha": 0.1
 }

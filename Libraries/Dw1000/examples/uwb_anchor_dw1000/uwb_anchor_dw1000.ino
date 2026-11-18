@@ -1,7 +1,7 @@
 #include <SPI.h>
 #include <DW1000.h>
 
-#define APP_NAME "UWB ANCHOR DW1000 v2.1"
+#define APP_NAME "UWB ANCHOR DW1000 v2.4"
 
 /*
  * UWB anchor (SS-TWR responder) with a DWM1000. Answers polls addressed to
@@ -51,7 +51,7 @@ const uint8_t PIN_SS = 7;
 #error "Supported boards: custom STM32F103RCT6 board, ESP32-C3."
 #endif
 
-/* The tag expects this exact delay. Reply prep time is measured and printed;
+/* Reply goes out exactly this long after the poll RX timestamp. Prep time is measured;
  * past REPLY_DELAY_US the DW1000 would hold the frame for a 17 s timer wrap. */
 #define REPLY_DELAY_US 3000
 #define ANTENNA_DELAY 16436
@@ -78,11 +78,13 @@ static byte resp_msg[RESP_DATA_LEN] = {FC_LO, FC_HI, 0, PAN_LO, PAN_HI, 0, 0,
 
 volatile boolean received = false;
 volatile boolean rx_failed = false;
+volatile boolean rx_timeout = false;
 
 static bool verbose = false;
 static uint32_t n_resp = 0;
 static uint32_t n_late = 0;
 static uint32_t n_rx_err = 0;
+static uint32_t n_rx_to = 0;
 static uint32_t n_other = 0;
 static uint32_t n_tx_stuck = 0;
 static uint32_t n_rearm = 0;
@@ -116,6 +118,13 @@ static void handle_received() {
 /* Without this a bad frame (other UWB traffic nearby) stops the receiver for good. */
 static void handle_receive_failed() {
   rx_failed = true;
+}
+
+/* A preamble-like burst without SFD ends in an SFD timeout, which also stops the
+ * receiver. The library files it as a timeout, not a failure: without this the
+ * anchor stayed deaf until the watchdog (~2 rounds, ~3% of the polls). */
+static void handle_receive_timeout() {
+  rx_timeout = true;
 }
 
 static bool board_check() {
@@ -191,6 +200,7 @@ void setup() {
   configure();
   DW1000.attachReceivedHandler(handle_received);
   DW1000.attachReceiveFailedHandler(handle_receive_failed);
+  DW1000.attachReceiveTimeoutHandler(handle_receive_timeout);
   start_listen();
   say("listening");
 }
@@ -208,8 +218,19 @@ static void reply_to_poll(const byte *poll) {
   rx_time.getTimestamp(rx_ts);
 
   DW1000.newTransmit();
-  DW1000Time tx_time = DW1000.setDelay(DW1000Time((int32_t)REPLY_DELAY_US, DW1000Time::MICROSECONDS));
+  /* setDelay() counts from "now" (reply landed at prep + 3 ms, varying). Keep it
+   * for the TXDLYS bit, then overwrite DX_TIME with poll RX + REPLY_DELAY_US so the
+   * reply comes exactly when the tag expects it, like the DW3000 anchor. */
+  const DW1000Time reply_delay((int32_t)REPLY_DELAY_US, DW1000Time::MICROSECONDS);
+  DW1000.setDelay(reply_delay);
+  DW1000Time tx_time = rx_time + reply_delay;
   byte tx_ts[5] = {0};
+  tx_time.getTimestamp(tx_ts);
+  tx_ts[0] = 0;
+  tx_ts[1] &= 0xFE;
+  DW1000.writeBytes(DX_TIME, NO_SUB, tx_ts, LEN_DX_TIME);
+  tx_time.setTimestamp(tx_ts);
+  tx_time += DW1000Time((int64_t)ANTENNA_DELAY);
   tx_time.getTimestamp(tx_ts);
 
   resp_msg[IDX_SEQ] = poll[IDX_SEQ];
@@ -231,7 +252,8 @@ static void reply_to_poll(const byte *poll) {
   if (prep_us > max_prep_us) {
     max_prep_us = prep_us;
   }
-  if (prep_us >= REPLY_DELAY_US) {
+  /* The preamble (~150 us) has to start before the scheduled RMARKER time. */
+  if (prep_us + 200 >= REPLY_DELAY_US) {
     n_late++;
     DW1000.idle();
     start_listen();
@@ -268,10 +290,10 @@ static void print_stats() {
     return;
   }
   last = millis();
-  char line[112];
-  snprintf(line, sizeof(line), "STATS resp %lu  late %lu  tx stuck %lu  rx err %lu  other %lu  rearm %lu",
+  char line[128];
+  snprintf(line, sizeof(line), "STATS resp %lu  late %lu  tx stuck %lu  rx err %lu  rx to %lu  other %lu  rearm %lu",
            (unsigned long)n_resp, (unsigned long)n_late, (unsigned long)n_tx_stuck,
-           (unsigned long)n_rx_err, (unsigned long)n_other, (unsigned long)n_rearm);
+           (unsigned long)n_rx_err, (unsigned long)n_rx_to, (unsigned long)n_other, (unsigned long)n_rearm);
   say(line);
   snprintf(line, sizeof(line), "  reply prep max %lu us (reply delay %u us)  DEV_ID %08lX",
            (unsigned long)max_prep_us, (unsigned)REPLY_DELAY_US, (unsigned long)read_dev_id());
@@ -296,7 +318,7 @@ static void handle_console() {
       verbose = !verbose;
       say(verbose ? "verbose on" : "verbose off");
     } else if (c == 'z') {
-      n_resp = n_late = n_rx_err = n_other = n_tx_stuck = n_rearm = max_prep_us = 0;
+      n_resp = n_late = n_rx_err = n_rx_to = n_other = n_tx_stuck = n_rearm = max_prep_us = 0;
       say("stats zeroed");
     } else if (c == 'r') {
       DW1000.idle();
@@ -310,17 +332,22 @@ static void handle_console() {
  * 8..12 are the RX state, 0 = idle. */
 static void rx_watchdog() {
   static uint32_t last = 0;
-  if (millis() - last < 50) {
+  if (millis() - last < 10) {
     return;
   }
   last = millis();
+  /* Two idle reads in a row: a glitch read of the bit-banged SPI would
+   * otherwise restart RX in the middle of a poll. */
   byte ss[4];
-  DW1000.readBytes(0x19, NO_SUB, ss, 4);
-  /* IRQ high means a frame just finished: leave it for handleInterrupt(). */
-  if ((ss[1] & 0x1F) == 0 && digitalRead(PIN_IRQ) == LOW) {
-    n_rearm++;
-    start_listen();
+  for (uint8_t k = 0; k < 2; k++) {
+    DW1000.readBytes(0x19, NO_SUB, ss, 4);
+    /* IRQ high means a frame just finished: leave it for handleInterrupt(). */
+    if ((ss[1] & 0x1F) != 0 || digitalRead(PIN_IRQ) == HIGH) {
+      return;
+    }
   }
+  n_rearm++;
+  start_listen();
 }
 
 void loop() {
@@ -332,6 +359,11 @@ void loop() {
   if (digitalRead(PIN_IRQ) == HIGH || (millis() - last_poll) >= 5) {
     last_poll = millis();
     DW1000.handleInterrupt();
+  }
+  if (rx_timeout) {
+    rx_timeout = false;
+    n_rx_to++;
+    start_listen();
   }
   if (rx_failed) {
     rx_failed = false;

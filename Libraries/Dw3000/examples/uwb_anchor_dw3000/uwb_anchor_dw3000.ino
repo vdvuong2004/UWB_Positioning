@@ -1,6 +1,7 @@
 #include "dw3000.h"
+#include <math.h>
 
-#define APP_NAME "UWB ANCHOR DW3000 v2.0"
+#define APP_NAME "UWB ANCHOR DW3000 v2.2"
 /*
  * UWB anchor (SS-TWR responder) with a DWM3000. Answers polls addressed to
  * ANCHOR_ID from uwb_tag. Give every anchor its own ID and list it in the
@@ -41,6 +42,12 @@
 #error "Supported boards: custom STM32F103RCT6 board, ESP32."
 #endif
 
+/* Reply power follows the poll: a poll weaker than WEAK_POLL_DBM means the tag
+ * is far, so answer at TX_POWER_HIGH; a strong poll means it is close, and the
+ * low TX_POWER keeps its receiver out of saturation. */
+#define TX_POWER_HIGH 0xFD
+#define WEAK_POLL_DBM (-85.0f)
+
 #define TX_ANT_DLY 16385
 #define RX_ANT_DLY 16385
 
@@ -57,6 +64,10 @@ static dwt_config_t config = {
     (129 + 8 - 8), DWT_STS_MODE_OFF, DWT_STS_LEN_64, DWT_PDOA_M0
 };
 static dwt_txconfig_t txconfig = {0x34, TX_POWER * 0x01010101UL, 0x0};
+static dwt_txconfig_t txconfig_high = {0x34, TX_POWER_HIGH * 0x01010101UL, 0x0};
+static bool tx_high = false;
+/* WEAK_POLL_DBM as the linear C 2^21 / N^2 4^D value: no log10 in the reply path. */
+static float weak_poll_lin;
 
 #define FC_LO 0x41
 #define FC_HI 0x88
@@ -84,6 +95,8 @@ static uint32_t n_rx_err = 0;
 static uint32_t n_other = 0;   /* good frames that are not a poll for this anchor */
 static uint32_t max_prep_us = 0;
 static uint32_t last_err_status = 0;
+static uint32_t n_high = 0;         /* replies sent at TX_POWER_HIGH */
+static float poll_dbm_sum = 0;      /* poll RX level of answered polls */
 static bool verbose = false;
 
 static void say(const char *msg)
@@ -152,7 +165,10 @@ void setup()
   if (dwt_configure(&config)) {
     halt("CONFIG FAILED (RX cal): check the module supply");
   }
+  /* The RX level registers (IP_DIAG_1/12) stay 0 unless CIA diagnostics are on. */
+  dwt_configciadiag(DW_CIA_DIAG_LOG_ALL);
   dwt_configuretxrf(&txconfig);
+  weak_poll_lin = powf(10.0f, (WEAK_POLL_DBM + 121.7f) / 10.0f);
   spiSetFastRate();
   dwt_setrxantennadelay(RX_ANT_DLY);
   dwt_settxantennadelay(TX_ANT_DLY);
@@ -179,7 +195,8 @@ static void handle_console(void)
       verbose = !verbose;
       say(verbose ? "verbose on" : "verbose off");
     } else if (c == 'z' || c == 'Z') {
-      n_resp = n_late = n_rx_err = n_other = max_prep_us = 0;
+      n_resp = n_late = n_rx_err = n_other = max_prep_us = n_high = 0;
+      poll_dbm_sum = 0;
       say("stats zeroed");
     }
   }
@@ -199,6 +216,9 @@ static void print_stats(void)
   snprintf(line, sizeof(line), "  reply prep max %lu us (reply delay %u us)  last err %08lX",
            (unsigned long)max_prep_us, (unsigned)REPLY_DELAY_US, (unsigned long)last_err_status);
   say(line);
+  snprintf(line, sizeof(line), "  poll rx avg %d dBm  high power replies %lu",
+           n_resp ? (int)lroundf(poll_dbm_sum / n_resp) : 0, (unsigned long)n_high);
+  say(line);
 }
 
 /* Reads SYS_STATUS twice and drops bit-banged SPI glitch reads. */
@@ -213,6 +233,28 @@ static bool read_status(uint32_t *out)
   return true;
 }
 
+/* Poll RX level, linear (see rx_lin_to_dbm). DW3000 user manual 4.7.2, PRF 64 MHz. */
+#define DGC_DBG_ADDR 0x30060 /* not in dw3000_regs.h; DGC decision in bits 30:28 */
+static float rx_level_lin(void)
+{
+  uint32_t c = dwt_read32bitreg(IP_DIAG_1_ID) & 0x1FFFFUL;
+  uint32_t n = dwt_read32bitreg(IP_DIAG_12_ID) & 0xFFFUL;
+  uint32_t d = (dwt_read32bitreg(DGC_DBG_ADDR) >> 28) & 0x7UL;
+  if (n == 0) {
+    return 0.0f;
+  }
+  float lin = (float)c * 2097152.0f / ((float)n * (float)n);
+  for (; d > 0; d--) {
+    lin *= 3.981f; /* +6 dB per DGC step */
+  }
+  return lin;
+}
+
+static float rx_lin_to_dbm(float lin)
+{
+  return lin > 0.0f ? 10.0f * log10f(lin) - 121.7f : -150.0f;
+}
+
 static bool is_poll_for_me(const uint8_t *f, uint32_t len)
 {
   return len == POLL_LEN && f[0] == FC_LO && f[1] == FC_HI && f[3] == PAN_LO && f[4] == PAN_HI &&
@@ -222,7 +264,6 @@ static bool is_poll_for_me(const uint8_t *f, uint32_t len)
 void loop()
 {
   handle_console();
-  print_stats();
 
   /* A leftover error bit would end the wait below before any frame arrives. */
   dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_GOOD | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO);
@@ -239,6 +280,7 @@ void loop()
     }
     if ((millis() - wait_start) > 200) {
       dwt_writefastCMD(CMD_TXRXOFF);
+      print_stats();
       return;
     }
   }
@@ -263,6 +305,12 @@ void loop()
   }
 
   uint64_t poll_rx_ts = get_rx_timestamp_u64();
+  float poll_lin = rx_level_lin();
+  bool want_high = poll_lin < weak_poll_lin;
+  if (want_high != tx_high) {
+    dwt_configuretxrf(want_high ? &txconfig_high : &txconfig);
+    tx_high = want_high;
+  }
   uint32_t resp_tx_time = (uint32_t)((poll_rx_ts + ((uint64_t)REPLY_DELAY_US * UUS_TO_DWT_TIME)) >> 8);
   dwt_setdelayedtrxtime(resp_tx_time);
   uint64_t resp_tx_ts = (((uint64_t)(resp_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
@@ -300,7 +348,15 @@ void loop()
   }
   dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
   n_resp++;
+  n_high += tx_high;
+  float poll_dbm = rx_lin_to_dbm(poll_lin);
+  poll_dbm_sum += poll_dbm;
   if (verbose) {
-    say("RESP sent");
+    char vline[48];
+    snprintf(vline, sizeof(vline), "RESP sent  poll %d dBm  %s", (int)lroundf(poll_dbm), tx_high ? "high" : "low");
+    say(vline);
   }
+  /* Printing blocks (~1 ms per 10 chars on USART) with RX off. Right after our
+   * reply the tag is busy with the other anchors, so no poll for us is missed. */
+  print_stats();
 }
