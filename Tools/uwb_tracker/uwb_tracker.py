@@ -41,10 +41,6 @@ ANCHORS_RE = re.compile(r"anchors:(.*)")
 PERIOD_RE = re.compile(r"round period (\d+) ms")
 RATE_RE = re.compile(r"RATE period (\d+) ms\s+round ([\d.]+) ms")
 SPREAD_RE = re.compile(r"SPREAD (\S+) n \d+\s+([\d.]+) Hz")
-# On-tag filter output (uwb_tag v2.3+): POS <x> <y> v <vx> <vy> used n/m [fix x y]
-POS_RE = re.compile(r"POS\s+(-?[\d.]+)\s+(-?[\d.]+)\s+v\s+(-?[\d.]+)\s+(-?[\d.]+)")
-FILTER_RE = re.compile(r"FILTER avg (\d+) us max (\d+) us.*overrun (\d+)")
-TAG_POS = "@POS"  # queue key for POS lines, never an anchor ID
 
 
 def load_config(path):
@@ -106,14 +102,6 @@ def serial_source(ser, out, anchors, log_path, stop, tag_info, iir_alpha):
                 if m:
                     out.put((t, m.group(1), float(m.group(2)), bool(m.group(3))))
                     continue
-                m = POS_RE.search(line)
-                if m:
-                    out.put((t, TAG_POS, tuple(float(g) for g in m.groups()), False))
-                    continue
-                m = FILTER_RE.search(line)
-                if m:
-                    tag_info["filter"] = tuple(int(g) for g in m.groups())
-                    continue
                 # Rate report of the tag (uwb_tag v2.1+), shown on the map.
                 m = PERIOD_RE.search(line)
                 if m:
@@ -163,13 +151,9 @@ def replay_source(path, out, speed, stop):
             except ValueError:
                 continue
             m = DIST_RE.search(parts[1])
-            if m:
-                item = (t, m.group(1), float(m.group(2)), bool(m.group(3)))
-            else:
-                m = POS_RE.search(parts[1])
-                if not m:
-                    continue
-                item = (t, TAG_POS, tuple(float(g) for g in m.groups()), False)
+            if not m:
+                continue
+            item = (t, m.group(1), float(m.group(2)), bool(m.group(3)))
             wait = t / speed - (time.monotonic() - t_start)
             if wait > 0:
                 time.sleep(wait)
@@ -293,15 +277,9 @@ class Tracker:
         self.fixes = deque(maxlen=60)
         self.track = deque(maxlen=300)
         self.n_used = self.n_rejected = self.n_unknown = 0
-        self.tag_pos = None  # (x, y, vx, vy) from the tag's own filter
-        self.tag_track = deque(maxlen=300)
         self.centre = np.mean([a["pos"] for a in anchors.values()], axis=0)
 
     def add(self, t, tag, r_raw, compensated=False):
-        if tag == TAG_POS:
-            self.tag_pos = r_raw
-            self.tag_track.append(r_raw[:2])
-            return
         a = self.anchors.get(tag)
         if a is None:
             self.n_unknown += 1
@@ -355,7 +333,7 @@ class Tracker:
 # Plot
 # ---------------------------------------------------------------------------
 
-def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None, ser=None, tag_info=None):
+def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None, ser=None, tag_info=None, fps=40):
     import matplotlib
     if snapshot:
         matplotlib.use("Agg")
@@ -390,20 +368,33 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None, ser=
         c = colors[i % len(colors)]
         ax.plot(*a["pos"], marker="^", markersize=12, color=c, linestyle="none")
         ax.annotate(a["name"], a["pos"], textcoords="offset points", xytext=(8, 8), color=c)
-        circ = Circle(a["pos"], 0.01, fill=False, color=c, alpha=0.35, linestyle="--")
+        # Solid, opaque, light colour: dashes and alpha make it slower to blit.
+        light = [0.65 + 0.35 * v for v in matplotlib.colors.to_rgb(c)]
+        circ = Circle(a["pos"], 0.01, fill=False, edgecolor=light, linewidth=0.8)
         ax.add_patch(circ)
         circles[tag] = circ
 
     fix_dots, = ax.plot([], [], ".", color="0.6", markersize=4, label="least-squares fix (raw)")
-    trail, = ax.plot([], [], "-", color="tab:red", linewidth=1.5, alpha=0.7,
+    # No alpha on the trail: a translucent 300-point line is the slowest artist to blit.
+    trail, = ax.plot([], [], "-", color="#e8807f", linewidth=1.5,
                      label="raw track" if tracker.raw else "EKF track")
     tag_dot, = ax.plot([], [], "o", color="tab:red", markersize=11, label="tag (raw)" if tracker.raw else "tag (EKF)")
-    board_trail, = ax.plot([], [], "-", color="tab:orange", linewidth=1.5, alpha=0.8, label="on-tag filter track")
-    board_dot, = ax.plot([], [], "s", color="tab:orange", markersize=9, label="on-tag filter (POS)")
     ell = Ellipse((0, 0), 0, 0, fill=False, color="tab:red", alpha=0.6)
     ax.add_patch(ell)
+    # Info box: a Tk label over the map when there is a window. A matplotlib text box
+    # costs ~70 ms per draw (8x all the other artists), which capped the map at ~6 fps.
+    info_label = None
+    if not snapshot:
+        try:
+            import tkinter as tk
+            info_label = tk.Label(fig.canvas.get_tk_widget(), text="", font=("Consolas", 9), justify="left",
+                                  anchor="nw", bg="white", relief="solid", borderwidth=1, padx=6, pady=4)
+            info_label.place(x=70, y=45)
+        except Exception:
+            info_label = None
     info = ax.text(0.01, 0.99, "", transform=ax.transAxes, va="top", family="monospace", fontsize=9,
-                   bbox=dict(boxstyle="round", fc="white", alpha=0.8))
+                   bbox=dict(boxstyle="round", fc="white", alpha=0.8), visible=info_label is None)
+    last_info = {"t": 0.0, "text": None}
     ax.legend(loc="lower right", fontsize=8)
 
     def on_key(event):
@@ -455,12 +446,6 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None, ser=
             lines.append(f"x {x:6.2f} m   y {y:6.2f} m   v {speed:4.2f} m/s")
         else:
             lines.append("waiting for ranges from 3 anchors ...")
-        if tracker.tag_pos is not None:
-            bt = np.array(tracker.tag_track)
-            board_trail.set_data(bt[:, 0], bt[:, 1])
-            bx, by, bvx, bvy = tracker.tag_pos
-            board_dot.set_data([bx], [by])
-            lines.append(f"on-tag x {bx:6.2f} m   y {by:6.2f} m   v {math.hypot(bvx, bvy):4.2f} m/s")
         hz = tag_info.get("hz", {})
         for tag, a in anchors.items():
             rate = f"  {hz[tag]:4.1f} Hz" if tag in hz else ""
@@ -472,15 +457,22 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None, ser=
             rnd = tag_info.get("round")
             rnd = f"{rnd:.1f} ms" if rnd is not None else "(measuring, 5 s)"
             lines.append(f"tag period {tag_info['period']} ms  round {rnd}  [f = change]")
-        if "filter" in tag_info:
-            avg, mx, over = tag_info["filter"]
-            lines.append(f"on-tag filter {avg} us (max {mx})  overrun {over} / 5 s")
         if tracker.raw:
             lines.append(f"fixes {tracker.n_used}")
         else:
             lines.append(f"ranges used {tracker.n_used}  rejected {tracker.n_rejected}  restarts {tracker.n_restarts}")
-        info.set_text("\n".join(lines))
-        return circles.values(), fix_dots, trail, tag_dot, board_trail, board_dot, ell, info
+        text = "\n".join(lines)
+        now = time.monotonic()
+        if info_label is not None:
+            # 5 Hz is enough to read and keeps Tk work off most frames.
+            if text != last_info["text"] and now - last_info["t"] > 0.2:
+                info_label.config(text=text)
+                last_info["t"], last_info["text"] = now, text
+            return artists
+        info.set_text(text)
+        return artists + [info]
+
+    artists = [*circles.values(), fix_dots, trail, tag_dot, ell]
 
     if snapshot:
         t_end = time.monotonic() + snapshot_after
@@ -491,7 +483,12 @@ def run_plot(tracker, q, snapshot=None, snapshot_after=15.0, map_size=None, ser=
         fig.savefig(snapshot, dpi=110)
         print(f"saved {snapshot}")
         return
-    _anim = FuncAnimation(fig, frame, interval=100, cache_frame_data=False)
+    # blit: redraw only the moving artists over a cached background (~9 ms instead
+    # of ~160 ms for the whole maximized figure).
+    # The timer waits `interval` after each frame is drawn, not between frame starts,
+    # so leave room for the ~30 ms a maximized window takes to draw and blit.
+    _anim = FuncAnimation(fig, frame, interval=max(1, int(1000 / fps) - 30), blit=info_label is not None,
+                          cache_frame_data=False)
     try:  # maximize once shown: plt.show() deiconifies the Tk window back to normal size
         win = fig.canvas.manager.window
         win.after(300, lambda: win.state("zoomed"))
@@ -514,6 +511,7 @@ def main():
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed factor")
     ap.add_argument("--snapshot", help="no window: run for --seconds, save the plot to this PNG and exit")
     ap.add_argument("--seconds", type=float, default=15.0)
+    ap.add_argument("--fps", type=float, default=30.0, help="map redraw rate (default 30)")
     args = ap.parse_args()
 
     anchors, range_sigma, accel_sigma, map_size, iir_alpha = load_config(args.config)
@@ -533,7 +531,7 @@ def main():
     tracker = Tracker(anchors, range_sigma, accel_sigma, raw=args.raw)
     try:
         run_plot(tracker, q, snapshot=args.snapshot, snapshot_after=args.seconds, map_size=map_size,
-                 ser=ser, tag_info=tag_info)
+                 ser=ser, tag_info=tag_info, fps=args.fps)
     finally:
         stop.set()
 

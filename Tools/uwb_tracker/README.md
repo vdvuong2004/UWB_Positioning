@@ -29,6 +29,7 @@ python uwb_tracker.py --port COM6                 chạy trực tiếp từ boar
 python uwb_tracker.py --port COM6 --log run.txt   vừa chạy vừa lưu dữ liệu
 python uwb_tracker.py --replay run.txt            phát lại một lần đo đã lưu
 python uwb_tracker.py --simulate                  tag giả lập, không cần phần cứng
+thêm --fps 20                                      giảm tốc độ vẽ nếu máy yếu (mặc định 30)
 ```
 
 ## Trên bản đồ
@@ -36,7 +37,6 @@ python uwb_tracker.py --simulate                  tag giả lập, không cần 
 - Tam giác: anchor. Vòng tròn nét đứt: khoảng cách đo mới nhất tới anchor đó.
 - Chấm xám: nghiệm least-squares thô (chưa lọc).
 - Đường đỏ, chấm đỏ: quỹ đạo và vị trí sau Kalman. Elip đỏ: vùng tin cậy 2σ.
-- Đường cam, ô vuông cam: vị trí do EKF trên tag tính (dòng `POS`, chỉ có ở tag v2.3–v2.5).
 - Góc trái: tọa độ, vận tốc, số khoảng cách được dùng hoặc bị loại, số lần khởi động lại bộ lọc.
 
 ## Tham số trong `anchors.json`
