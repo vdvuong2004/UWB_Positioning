@@ -1,8 +1,9 @@
 #include "dw3000.h"
+#include <Wire.h>
 #include <math.h>
 #include <stdlib.h>
 
-#define APP_NAME "UWB TAG v3.2"
+#define APP_NAME "UWB TAG v3.3"
 /*
  * UWB tag (SS-TWR initiator): custom STM32F103RCT6 board + DWM3000.
  * Fixed frame (ROUND_PERIOD_MS, 25 ms = 40 Hz):
@@ -15,6 +16,9 @@
  *   6. print one line per anchor ranged in this frame:
  *        DIST <anchor id> <d_filt> m raw <d_raw>
  * TX power adapts per anchor (see PWR_LADDER); "PWR <id> <hex>" marks a change.
+ * IMU (MPU6050 on I2C1, SCL PB6 / SDA PB7), read every IMU_PERIOD_MS between the
+ * exchanges, calibrated (accel 6-face, gyro bias at start):
+ *        IMU <t_ms> <ax> <ay> <az> <gx> <gy> <gz>      accel in g, gyro in deg/s
  * Tools/uwb_tracker reads these lines and draws the 2D map.
  *
  * Arduino IDE: Board "Generic STM32F1 series", part "Generic F103RCTx",
@@ -25,6 +29,8 @@
  * USB commands: p = pause/resume, z = zero stats, 1..9 = turn that anchor on/off,
  *               f = next round period (25/100/50/20/10/0 ms) to find the max update rate,
  *               d = DIST lines on/off, r = tries per anchor per round (2/3/1),
+ *               i = IMU lines on/off, g = IMU re-init + gyro bias (keep the tag still;
+ *               ranging stops for ~0.7 s),
  *               "C<id> <scale> <bias>\n" = range compensation of that anchor (bias in m),
  *               "L<alpha>\n" = IIR coefficient, 0 < alpha <= 1 (1 = no filtering).
  *               uwb_tracker sends C and L from anchors.json when it connects.
@@ -207,6 +213,51 @@ static float rng_m[N_ANCHORS];
 /* Frame stats, this stats window. */
 static uint16_t n_jump = 0, n_jump_reset = 0, n_overrun = 0, n_retry_skip = 0;
 
+/* MPU6050 (see examples/debug_imu for the bus test and the 6-face calibration). */
+#define PIN_IMU_SCL PB6
+#define PIN_IMU_SDA PB7
+#define IMU_I2C_HZ 400000
+#define IMU_ADDR 0x68
+#define IMU_REG_SMPLRT_DIV 0x19
+#define IMU_REG_CONFIG 0x1A
+#define IMU_REG_GYRO_CONFIG 0x1B
+#define IMU_REG_ACCEL_CONFIG 0x1C
+#define IMU_REG_ACCEL_XOUT_H 0x3B
+#define IMU_REG_PWR_MGMT_1 0x6B
+#define IMU_REG_WHO_AM_I 0x75
+#define IMU_DLPF 0x03      /* 44 Hz: cuts motor vibration */
+#define IMU_GYRO_CFG 0x08  /* +-500 deg/s */
+#define IMU_GYRO_LSB 65.5f
+#define IMU_ACCEL_CFG 0x08 /* +-4 g */
+#define IMU_ACCEL_LSB 8192.0f
+/* 100 Hz for the EKF predict step. One 14-byte read takes ~0.5 ms at 400 kHz;
+ * it runs only between exchanges, so a sample may come up to one exchange late
+ * (t_ms in the line is the real read time). */
+#define IMU_PERIOD_MS 10
+/* Gyro bias at start: the tag must lie still. A std above this means it moved. */
+#define IMU_CAL_SAMPLES 200
+#define IMU_CAL_MAX_STD_DPS 1.0f
+/* Accel a = (a_read - off) / scale, board B MPU, 6-face run 2026-11-18
+ * (debug_imu 'a'): this MPU reads +0.46 g on Z with no acceleration. */
+static const float IMU_ACC_OFF[3] = {0.0249f, -0.0080f, 0.4571f};
+static const float IMU_ACC_SCALE[3] = {0.9802f, 0.9938f, 1.0076f};
+/* Stop reading after this many failures in a row ('g' re-inits). */
+#define IMU_MAX_FAILS 20
+/* The Wire library waits up to 100 ms (I2C_TIMEOUT_TICK, compiled into the core)
+ * on a stuck bus. A failed read slower than this stops the IMU at once. */
+#define IMU_STUCK_US 5000
+/* Time of one IMU read, in the retry budget (measured max ~IMU_READ_US). */
+#define IMU_READ_US 600
+
+static bool imu_ok = false;
+static bool imu_tried = false; /* imu_start() ran at least once */
+static bool print_imu = true;
+static float imu_gyro_bias[3] = {0, 0, 0};
+static uint32_t imu_next_ms = 0;
+static uint8_t imu_fail_row = 0;
+static uint16_t imu_reads = 0, imu_errors = 0; /* this stats window */
+static uint32_t imu_us_max = 0;                 /* slowest good read, this window */
+
 /* USB CDC only: the write is copied to a buffer and returns at once. */
 static void say(const char *msg)
 {
@@ -289,7 +340,8 @@ static void banner(void)
   say(line);
   snprintf(line, sizeof(line), "tries per anchor %u", max_tries);
   say(line);
-  say("commands: p = pause/resume, z = zero stats, 1..9 = anchor on/off, f = round period, d = DIST on/off, r = tries");
+  say("commands: p = pause/resume, z = zero stats, 1..9 = anchor on/off, f = round period, d = DIST on/off, r = tries, i = IMU on/off, g = IMU init + gyro bias");
+  say(imu_ok ? "imu MPU6050 ok" : imu_tried ? "imu not running (g = retry)" : "imu starting after the DW3000");
   /* Last: uwb_tracker answers this line with the C/L commands. */
   print_anchors();
 }
@@ -338,6 +390,176 @@ static bool dw_start(void)
   return true;
 }
 
+static bool imu_write(uint8_t reg, uint8_t val)
+{
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+static bool imu_read_regs(uint8_t reg, uint8_t *buf, uint8_t n)
+{
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0 || Wire.requestFrom((uint8_t)IMU_ADDR, n) != n) {
+    return false;
+  }
+  for (uint8_t k = 0; k < n; k++) {
+    buf[k] = Wire.read();
+  }
+  return true;
+}
+
+/* Calibrated accel (g) and gyro (deg/s, bias removed). */
+static bool imu_sample(float *a, float *g)
+{
+  uint8_t b[14];
+  if (!imu_read_regs(IMU_REG_ACCEL_XOUT_H, b, 14)) {
+    return false;
+  }
+  for (uint8_t k = 0; k < 3; k++) {
+    int16_t ra = (int16_t)((b[2 * k] << 8) | b[2 * k + 1]);
+    int16_t rg = (int16_t)((b[8 + 2 * k] << 8) | b[9 + 2 * k]); /* after the temperature */
+    a[k] = (ra / IMU_ACCEL_LSB - IMU_ACC_OFF[k]) / IMU_ACC_SCALE[k];
+    g[k] = rg / IMU_GYRO_LSB - imu_gyro_bias[k];
+  }
+  return true;
+}
+
+static void imu_cal_gyro(void)
+{
+  float s[3] = {0, 0, 0}, s2[3] = {0, 0, 0};
+  uint16_t n = 0;
+  float old[3] = {imu_gyro_bias[0], imu_gyro_bias[1], imu_gyro_bias[2]};
+  imu_gyro_bias[0] = imu_gyro_bias[1] = imu_gyro_bias[2] = 0;
+  for (uint16_t i = 0; i < IMU_CAL_SAMPLES; i++) {
+    float a[3], g[3];
+    if (imu_sample(a, g)) {
+      for (uint8_t k = 0; k < 3; k++) {
+        s[k] += g[k];
+        s2[k] += g[k] * g[k];
+      }
+      n++;
+    }
+    delay(2);
+  }
+  float var_max = 0;
+  for (uint8_t k = 0; k < 3 && n; k++) {
+    float m = s[k] / n;
+    float v = s2[k] / n - m * m;
+    var_max = v > var_max ? v : var_max;
+  }
+  if (n < IMU_CAL_SAMPLES / 2 || var_max > IMU_CAL_MAX_STD_DPS * IMU_CAL_MAX_STD_DPS) {
+    for (uint8_t k = 0; k < 3; k++) {
+      imu_gyro_bias[k] = old[k];
+    }
+    say(n < IMU_CAL_SAMPLES / 2 ? "imu gyro bias: read errors, kept the old one"
+                                : "imu gyro bias: tag moved, kept the old one (g = retry)");
+    return;
+  }
+  char line[64];
+  int len = snprintf(line, sizeof(line), "imu gyro bias dps");
+  for (uint8_t k = 0; k < 3; k++) {
+    imu_gyro_bias[k] = s[k] / n;
+    len += snprintf(line + len, sizeof(line) - len, " ");
+    len += put_fixed(line + len, sizeof(line) - len, imu_gyro_bias[k]);
+  }
+  say(line);
+}
+
+/* Takes ~0.7 s (reset, settle, gyro bias); the tag must lie still. */
+static bool imu_start(void)
+{
+  static bool wire_on = false;
+  imu_ok = false;
+  imu_tried = true;
+  if (wire_on) {
+    Wire.end();
+  }
+  Wire.setSCL(PIN_IMU_SCL);
+  Wire.setSDA(PIN_IMU_SDA);
+  Wire.begin();
+  Wire.setClock(IMU_I2C_HZ);
+  wire_on = true;
+
+  uint8_t who = 0;
+  if (!imu_read_regs(IMU_REG_WHO_AM_I, &who, 1)) {
+    say("IMU NOT FOUND at 0x68 (PB6/PB7), ranging without it");
+    return false;
+  }
+  /* Reset, then wake on the gyro X PLL (steadier clock than the RC). */
+  imu_write(IMU_REG_PWR_MGMT_1, 0x80);
+  delay(100);
+  uint8_t chk[3] = {0, 0, 0};
+  bool ok = imu_write(IMU_REG_PWR_MGMT_1, 0x01) && imu_write(IMU_REG_SMPLRT_DIV, 0x00) &&
+            imu_write(IMU_REG_CONFIG, IMU_DLPF) && imu_write(IMU_REG_GYRO_CONFIG, IMU_GYRO_CFG) &&
+            imu_write(IMU_REG_ACCEL_CONFIG, IMU_ACCEL_CFG) && imu_read_regs(IMU_REG_CONFIG, chk, 3);
+  if (!ok || chk[0] != IMU_DLPF || chk[1] != IMU_GYRO_CFG || chk[2] != IMU_ACCEL_CFG) {
+    say("IMU CONFIG FAILED, ranging without it");
+    return false;
+  }
+  /* The first samples after wake-up are garbage (gyro -65 deg/s at rest). */
+  delay(100);
+  char line[48];
+  snprintf(line, sizeof(line), "imu WHO_AM_I %02X, +-4 g, +-500 dps", who);
+  say(line);
+  imu_cal_gyro();
+  imu_fail_row = 0;
+  imu_next_ms = millis();
+  imu_ok = true;
+  return true;
+}
+
+/* Called between exchanges and while waiting for the frame end. */
+static void imu_poll(void)
+{
+  if (!imu_ok || (int32_t)(millis() - imu_next_ms) < 0) {
+    return;
+  }
+  uint32_t now = millis();
+  imu_next_ms += IMU_PERIOD_MS;
+  if ((int32_t)(now - imu_next_ms) >= 0) {
+    imu_next_ms = now + IMU_PERIOD_MS; /* late (long exchange): no burst */
+  }
+  float a[3], g[3];
+  uint32_t t0 = micros();
+  bool ok = imu_sample(a, g);
+  uint32_t dt = micros() - t0;
+  if (!ok) {
+    imu_errors++;
+    if (dt > IMU_STUCK_US) {
+      imu_ok = false;
+      say("IMU BUS STUCK (check SDA/SCL), stopped; g = re-init");
+    } else if (++imu_fail_row >= IMU_MAX_FAILS) {
+      imu_ok = false;
+      say("IMU LOST (g = re-init)");
+    }
+    return;
+  }
+  if (dt > imu_us_max) {
+    imu_us_max = dt;
+  }
+  imu_fail_row = 0;
+  imu_reads++;
+  if (!print_imu) {
+    return;
+  }
+  /* 3 decimals for accel (1 mg), 2 for gyro. */
+  char line[96];
+  int len = snprintf(line, sizeof(line), "IMU %lu", (unsigned long)now);
+  for (uint8_t k = 0; k < 3; k++) {
+    long v = lroundf(a[k] * 1000.0f);
+    unsigned long u = v < 0 ? -v : v;
+    len += snprintf(line + len, sizeof(line) - len, " %s%lu.%03lu", v < 0 ? "-" : "", u / 1000, u % 1000);
+  }
+  for (uint8_t k = 0; k < 3; k++) {
+    len += snprintf(line + len, sizeof(line) - len, " ");
+    len += put_fixed(line + len, sizeof(line) - len, g[k]);
+  }
+  say(line);
+}
+
 void setup()
 {
   UART_init();
@@ -353,6 +575,7 @@ void setup()
   if (!dw_start()) {
     halt("DW3000 START FAILED");
   }
+  imu_start();
   reset_window();
   say("ranging");
 }
@@ -620,6 +843,8 @@ static void reset_window(void)
   rounds = 0;
   xchg_us_sum = xchg_us_max = xchg_n = 0;
   n_jump = n_jump_reset = n_overrun = n_retry_skip = 0;
+  imu_reads = imu_errors = 0;
+  imu_us_max = 0;
   stats_start_ms = millis();
 }
 
@@ -638,6 +863,12 @@ static void print_stats(void)
   snprintf(line, sizeof(line), "IIR jumps dropped %u  restarts %u  overrun %u  retries skipped %u",
            n_jump, n_jump_reset, n_overrun, n_retry_skip);
   say(line);
+  if (imu_ok || imu_errors) {
+    uint32_t imu_hz_x10 = (uint32_t)imu_reads * 10000UL / elapsed;
+    snprintf(line, sizeof(line), "IMU RATE %lu.%lu Hz  errors %u  read max %lu us", (unsigned long)(imu_hz_x10 / 10),
+             (unsigned long)(imu_hz_x10 % 10), imu_errors, (unsigned long)imu_us_max);
+    say(line);
+  }
   int len = snprintf(line, sizeof(line), "STATS");
   for (uint8_t i = 0; i < N_ANCHORS && len < (int)sizeof(line); i++) {
     len += snprintf(line + len, sizeof(line) - len, "  %u %u/%u", ANCHORS[i].id, stats[i].replies, stats[i].polls);
@@ -736,6 +967,11 @@ static void handle_usb(void)
     if (c == 'C' || c == 'L') {
       cmd[0] = c;
       cmd_len = 1;
+    } else if (c == 'i' || c == 'I') {
+      print_imu = !print_imu;
+      say(print_imu ? "IMU lines on" : "IMU lines off");
+    } else if (c == 'g' || c == 'G') {
+      imu_start();
     } else if (c == 'd' || c == 'D') {
       print_dist = !print_dist;
       say(print_dist ? "DIST lines on" : "DIST lines off");
@@ -784,6 +1020,7 @@ static void handle_usb(void)
 void loop()
 {
   handle_usb();
+  imu_poll();
   if (paused) {
     return;
   }
@@ -820,13 +1057,14 @@ void loop()
     for (uint8_t t = 0; t < max_tries; t++) {
       /* Retry only if it and one try for every anchor left still fit the frame. */
       if (t > 0 && round_period_ms &&
-          (micros() - round_start_us) + (uint32_t)(1 + n_left) * EXCHANGE_MAX_US + FRAME_TAIL_US >
+          (micros() - round_start_us) + (uint32_t)(1 + n_left) * (EXCHANGE_MAX_US + IMU_READ_US) + FRAME_TAIL_US >
               round_period_ms * 1000UL) {
         n_retry_skip++;
         break;
       }
       bool ok = range_one(i);
       adapt_power(i, ok, last_rx_dbm);
+      imu_poll();
       if (ok) {
         stats[i].ranged++;
         break;
@@ -844,5 +1082,6 @@ void loop()
   }
   while ((millis() - round_start) < round_period_ms) {
     handle_usb();
+    imu_poll();
   }
 }

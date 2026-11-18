@@ -7,12 +7,13 @@ This file guides Claude Code when it works in this repository.
 UWB indoor positioning. A tag (custom STM32F103RCT6 board + DWM3000) runs single-sided
 TWR against several anchors (DWM3000 or DWM1000) in a fixed 25 ms frame, compensates (`scale·d − bias`)
 median-5 + IIR + 2 cm dead band filters each range on the tag, and prints `DIST <id> <filtered m> m raw <raw m>` (USB only).
+An MPU6050 on the tag (I2C1 PB6/PB7) is read at 100 Hz between exchanges: `IMU <t_ms> ax ay az gx gy gz` (g, deg/s).
 `Tools/uwb_tracker` (Python) reads those lines, runs an EKF and draws a 2D map.
 The user-facing overview is `README.md` (Vietnamese). Talk to the user in Vietnamese.
 
 Layout:
 - `Libraries/Dw3000` — Arduino library `DW3000`: Decawave DW3000 C0 driver (API 04.00.00) + platform layer.
-  Examples: `uwb_tag`, `uwb_anchor_dw3000`, `debug_board_test`, `debug_radio_link`.
+  Examples: `uwb_tag`, `uwb_anchor_dw3000`, `debug_board_test`, `debug_radio_link`, `debug_imu`.
 - `Libraries/Dw1000` — Arduino library `DW1000`: low-level part of thotro/arduino-dw1000 + STM32 bit-bang SPI.
   Example: `uwb_anchor_dw1000`.
 - `Tools/uwb_tracker` — `uwb_tracker.py` (EKF + matplotlib), `anchors.json` (anchor positions by ID).
@@ -71,6 +72,12 @@ Custom boards log on their own USB CDC port; open it with DTR set or the sketch 
   clears every bit, so a frame finishing in between is wiped and RX stays idle (v2.4 lost ~9% of the polls this
   way; v2.5 checks the status first, `rearm` went 1005 -> 0, anchor 2 replies 99.8%).
 - ESP32-WROOM GPIO 6–11 are flash pins.
+- IMU on the tag: the board-B MPU6050 reads +0.46 g on Z at rest, so `IMU_ACC_OFF/SCALE` in `uwb_tag` are
+  per module (6-face run with `debug_imu` `a`). The Wire library waits 100 ms per transfer on a stuck bus,
+  so the tag stops the IMU after one slow failure; an IMU read (~0.53 ms) is in the retry budget.
+- Arduino puts its generated prototypes above the first function: a struct used in a function signature
+  must be declared before every function, or the build fails with "cannot be used as a function".
+- With 3 anchors a 25 ms frame has no room for a retry (a miss costs ~6.5 ms); `retries skipped` counts them.
 
 ## Hardware history (for debugging)
 

@@ -19,6 +19,7 @@ Libraries/
       uwb_anchor_dw3000/       anchor dùng DWM3000
       debug_board_test/        kiểm tra phần cứng một board mới (chân, SPI, driver, nguồn)
       debug_radio_link/        kiểm tra đường truyền radio giữa 2 board (TX/RX, mất gói, dBm)
+      debug_imu/               kiểm tra MPU6050 trên tag (bus I2C, WHO_AM_I) và hiệu chuẩn gia tốc 6 mặt
   Dw1000/                      driver DWM1000 (thư viện Arduino "DW1000")
     examples/
       uwb_anchor_dw1000/       anchor dùng DWM1000
@@ -34,6 +35,7 @@ install_libraries.bat          liên kết 2 thư viện vào Arduino IDE
 | Board custom STM32F103RCT6 + DWM1000 | anchor | Cùng header và chân như trên. |
 | ESP32-WROOM-32 + DWM3000 | anchor (trạm thử) | RST 4, IRQ 22, CS 21, SCK 18, MISO 19, MOSI 23. |
 | ESP32-C3 SuperMini + DWM1000 | anchor (trạm thử) | RST 2, IRQ 3, SCK 4, MISO 5, MOSI 6, CS 7. |
+| MPU6050 (GY-521) trên tag | IMU | I2C1: SCL PB6, SDA PB7, 3V3, địa chỉ 0x68. Hệ số hiệu chuẩn gia tốc ghi trong `uwb_tag` là của module trên board B (trục Z lệch +0.46 g); module khác thì đo lại bằng `debug_imu` (lệnh `a`). |
 
 Module chỉ cấp **3.3 V**. Khi một module chạy chập chờn, trước hết đo **GND giữa board và
 module** (phải khoảng 0 Ω): một chân GND hở ở header từng làm board chạy "lúc được lúc không".
@@ -65,7 +67,9 @@ Cấu hình board trong Arduino IDE:
    - Module DWM3000: `uwb_anchor_dw3000`
    - Module DWM1000: `uwb_anchor_dw1000`
 3. **Tag**: nạp `uwb_tag`. Khai báo các anchor trong bảng `ANCHORS[]` ở đầu sketch: ID và mức
-   công suất (`PWR_DW3000` hoặc `PWR_DW1000`). Log in `DIST <id> <mét> m` cho mỗi lần đo.
+   công suất (`LVL_DW3000` hoặc `LVL_DW1000`). Log in `DIST <id> <mét> m raw <mét>` cho mỗi lần đo
+   và `IMU <t_ms> ax ay az gx gy gz` (g, °/s) 100 lần/giây. Lúc bật nguồn để tag nằm yên ~1 s
+   để đo bias gyro.
 4. **Bản đồ**: điền tọa độ anchor vào `Tools/uwb_tracker/anchors.json`, đóng Serial Monitor rồi
    chạy `python Tools/uwb_tracker/uwb_tracker.py --port COMx` (COM của tag).
 
@@ -73,7 +77,8 @@ Lệnh qua Serial Monitor:
 
 | Sketch | Lệnh |
 |---|---|
-| `uwb_tag` | `p` dừng/chạy, `z` xóa thống kê, `1`..`9` bật/tắt anchor theo ID |
+| `uwb_tag` | `p` dừng/chạy, `z` xóa thống kê, `1`..`9` bật/tắt anchor theo ID, `d` / `i` bật/tắt dòng DIST / IMU, `g` khởi tạo lại IMU + đo bias gyro |
+| `debug_imu` | `a` hiệu chuẩn gia tốc 6 mặt, `c` bias gyro, `f` tần số in, `i` / `w` bật/tắt dòng IMU / số thô, `s` dò lại bus |
 | `uwb_anchor_dw3000` | `v` in từng lần trả lời, `z` xóa thống kê |
 | `uwb_anchor_dw1000` | `v`, `z`, `r` chạy lại kiểm tra board |
 
